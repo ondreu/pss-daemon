@@ -17,7 +17,7 @@ function tempRoot(): string {
 
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-const bytes = (text: string): ArrayBuffer => encoder.encode(text).buffer as ArrayBuffer;
+const bytes = (text: string): ArrayBuffer => encoder.encode(text).buffer;
 const text = (data: ArrayBuffer): string => decoder.decode(data);
 
 test('roundtrip: write, read, stat, list', async () => {

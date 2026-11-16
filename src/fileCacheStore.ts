@@ -59,7 +59,7 @@ function parseCacheFile(encoded: string): CacheFile | null {
     if (!Array.isArray(file['entries']) || !(file['entries'] as unknown[]).every(isStoredEntry)) {
         return null;
     }
-    return { version: CACHE_VERSION, marker: file['marker'] as string | null, entries: file['entries'] as StoredEntry[] };
+    return { version: CACHE_VERSION, marker: file['marker'], entries: file['entries'] as StoredEntry[] };
 }
 
 /**

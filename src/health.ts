@@ -9,7 +9,6 @@ import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { SyncSummary } from '../../src/sync/engine';
-import type { PendingMassDelete } from '../../src/sync/engine/types';
 
 /** What the daemon is doing, as far as a supervisor is concerned. */
 export type DaemonState = 'starting' | 'idle' | 'syncing' | 'error' | 'signed-out' | 'mass-delete-held' | 'stopped' | 'unknown';
@@ -72,11 +71,11 @@ function normalizeHealth(raw: unknown, healthPath: string): HealthFile {
     }
     const held = record['massDeleteHeld'];
     const summary = record['lastSummary'] as SyncSummary | null;
-    const pending = summary && typeof summary === 'object' && 'pendingMassDelete' in summary ? (summary.pendingMassDelete as PendingMassDelete | undefined) : undefined;
+    const pending = summary && typeof summary === 'object' && 'pendingMassDelete' in summary ? (summary.pendingMassDelete) : undefined;
     return {
         updatedAt: record['updatedAt'],
         state: record['state'] as DaemonState,
-        lastSummary: (summary ?? null) as SyncSummary | null,
+        lastSummary: (summary ?? null),
         pendingConflicts: typeof record['pendingConflicts'] === 'number' ? record['pendingConflicts'] : 0,
         massDeleteHeld: Array.isArray(held) ? held.filter((entry): entry is string => typeof entry === 'string') : (pending?.paths ?? []),
         error: typeof record['error'] === 'string' ? record['error'] : null,

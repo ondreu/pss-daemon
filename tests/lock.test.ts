@@ -56,7 +56,7 @@ test('a dead owner is taken over loudly, never silently', async () => {
             (message) => reasons.push(message),
         );
         assert.equal(reasons.length, 1);
-        assert.match(reasons[0]!, /999001/);
+        assert.match(reasons[0], /999001/);
         assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { pid: number }).pid, 222);
         await lock.release();
     } finally {
@@ -76,7 +76,7 @@ test('an unreadable lock file is taken over, not trusted', async () => {
             probe(),
             (message) => reasons.push(message),
         );
-        assert.match(reasons[0]!, /unreadable/);
+        assert.match(reasons[0], /unreadable/);
         await lock.release();
     } finally {
         rmSync(root, { recursive: true, force: true });
@@ -96,7 +96,7 @@ test('a boot id change takes over even when the pid is alive', async () => {
             probe({ isAlive: () => true, readBootId: () => 'boot-new' }),
             (message) => reasons.push(message),
         );
-        assert.match(reasons[0]!, /previous boot/);
+        assert.match(reasons[0], /previous boot/);
         await lock.release();
         // Same boot, live pid: held.
         writeFileSync(lockPath, JSON.stringify({ pid: 4242, bootId: 'boot-new', startedAt: 'old', vaultPath: '/vault' }));

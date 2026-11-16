@@ -12,7 +12,7 @@ import { runCommand } from './commands';
 async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
     const parsed = parseArgs(argv);
     if (parsed.version === true) {
-        process.stdout.write(`${require('../package.json').version}\n`);
+        process.stdout.write(`${__DAEMON_VERSION__}\n`);
         return 0;
     }
     if (parsed.probe === true) {

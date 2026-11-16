@@ -8,15 +8,10 @@
  * state from ever reading as "fresh" and a fresh state from ever trusting a
  * stale Drive cache.
  *
- * Tests inject fakes through {@link DaemonDeps}; production defaults are
- * resolved lazily. The two factories owned by parallel streams
- * (`CreateHeadlessVault` from `./headlessApp`, `CreateProtonAuth` from
- * `./auth`) do not exist in this worktree yet, so the defaults load them
- * through a computed module specifier: esbuild leaves a non-literal
- * `import()` alone at bundle time instead of failing the build the way a
- * literal specifier to a missing file would. The integration pass replaces
- * {@link loadCreateVault} and {@link loadCreateAuth} with static imports
- * once those files land — the seams are exactly these two functions.
+ * Tests inject fakes through {@link DaemonDeps}; production defaults are the
+ * real factories: `createHeadlessVault` from `./headlessApp` and
+ * `createProtonAuth` from `./auth`. They are statically imported so a rename
+ * breaks the build instead of showing up as a runtime "seam" error.
  */
 import { createHash, randomUUID } from 'node:crypto';
 import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
@@ -33,41 +28,13 @@ import { DESKTOP } from '../../src/sync/engine/types';
 import { SyncState } from '../../src/sync/state';
 import type { SyncRecord } from '../../src/sync/types';
 import { Logger } from '../../src/util/logger';
+import { createProtonAuth } from './auth';
 import { ensureDaemonDirs, loadKeyMaterial, vaultLockFile } from './config';
+import { createHeadlessVault } from './headlessApp';
 import { acquireDaemonLocks, LockHeldError, releaseLocks, type DaemonLock, type LockProbe } from './lock';
 import { emptyHealth, writeHealthFile, type DaemonState, type HealthFile } from './health';
-import type { CreateHeadlessVault, CreateProtonAuth, HeadlessVault, ProtonAuth } from './ports';
+import type { CreateHeadlessVault, CreateProtonAuth, HeadlessVault } from './ports';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from './types';
-
-// ---------------------------------------------------------------------------
-// seams to the parallel streams
-// ---------------------------------------------------------------------------
-
-/**
- * Computed specifiers on purpose: a literal `import('./headlessApp')` would
- * make esbuild resolve the module at bundle time, which fails until stream
- * A lands the file. A computed specifier bundles fine and resolves at
- * runtime, when the file exists. Tests never reach these functions — they
- * inject fakes through {@link DaemonDeps}.
- */
-const HEADLESS_APP_SPEC = './headless' + 'App';
-const AUTH_SPEC = './' + 'auth';
-
-async function loadCreateVault(): Promise<CreateHeadlessVault> {
-    const module = (await import(HEADLESS_APP_SPEC)) as { createHeadlessVault?: unknown };
-    if (typeof module.createHeadlessVault !== 'function') {
-        throw new Error(`Integration seam: ${HEADLESS_APP_SPEC} does not export createHeadlessVault yet.`);
-    }
-    return module.createHeadlessVault as CreateHeadlessVault;
-}
-
-async function loadCreateAuth(): Promise<CreateProtonAuth> {
-    const module = (await import(AUTH_SPEC)) as { createProtonAuth?: unknown };
-    if (typeof module.createProtonAuth !== 'function') {
-        throw new Error(`Integration seam: ${AUTH_SPEC} does not export createProtonAuth yet.`);
-    }
-    return module.createProtonAuth as CreateProtonAuth;
-}
 
 // ---------------------------------------------------------------------------
 // narrow interfaces: what the lifecycle needs, so fakes can stand in
@@ -361,7 +328,7 @@ export function installShutdownHandlers(options: {
     exit?: (code: number) => void;
     onFirst: () => void;
 }): () => void {
-    const emitter = options.emitter ?? (process as unknown as SignalEmitter);
+    const emitter = options.emitter ?? (process);
     const exit = options.exit ?? ((code: number) => process.exit(code));
     let first = false;
     const handler = (): void => {
@@ -477,7 +444,7 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
             void engineRef?.stop().catch(() => undefined);
         };
 
-        const createVault = deps.createVault ?? (await loadCreateVault());
+        const createVault = deps.createVault ?? createHeadlessVault;
         const vault = await createVault({
             vaultPath: config.vaultPath,
             configDir: config.configDir,
@@ -490,7 +457,7 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
             ...(request.autoSync ? { rescanSeconds: 900 } : {}),
         });
 
-        const createAuth = deps.createAuth ?? (await loadCreateAuth());
+        const createAuth = deps.createAuth ?? createProtonAuth;
         const auth = await createAuth({ dataDir: config.dataDir, key, clientUid, logger, remoteFolderUid: config.remoteFolderUid });
         let restored: boolean;
         try {
@@ -739,7 +706,7 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
             if (options.json === true) {
                 io.stdout(JSON.stringify(report));
             } else {
-                jsonLog(io, 'info', 'dry-run', `Would sync ${changes} paths (${plan.uploads.length} uploads, ${plan.downloads.length} downloads, ${plan.conflicts.length} conflicts, ${plan.removals.length} removals).`, report as Record<string, unknown>);
+                jsonLog(io, 'info', 'dry-run', `Would sync ${changes} paths (${plan.uploads.length} uploads, ${plan.downloads.length} downloads, ${plan.conflicts.length} conflicts, ${plan.removals.length} removals).`, report);
             }
             const wouldHold = boot.config.massDeleteThreshold > 0 && plan.removals.length >= boot.config.massDeleteThreshold;
             await boot.writeHealth({ state: 'idle', error: null });
@@ -1035,7 +1002,7 @@ export async function runLogin(options: {
         const key = await loadKeyMaterial(env);
         const clientUid = await readClientUid(options.config.dataDir);
         const logger = new Logger(options.config.logLevel, 'pss-daemon');
-        const createAuth = deps.createAuth ?? (await loadCreateAuth());
+        const createAuth = deps.createAuth ?? createProtonAuth;
         const auth = await createAuth({ dataDir: options.config.dataDir, key, clientUid, logger, remoteFolderUid: options.config.remoteFolderUid });
 
         let restored = false;
@@ -1117,7 +1084,7 @@ export async function runSignOut(options: {
             const key = await loadKeyMaterial(env);
             const clientUid = await readClientUid(options.config.dataDir);
             const logger = new Logger(options.config.logLevel, 'pss-daemon');
-            const createAuth = deps.createAuth ?? (await loadCreateAuth());
+            const createAuth = deps.createAuth ?? createProtonAuth;
             const auth = await createAuth({ dataDir: options.config.dataDir, key, clientUid, logger, remoteFolderUid: options.config.remoteFolderUid });
             await auth.signOut();
             jsonLog(io, 'info', 'auth', 'Signed out; the stored session is cleared.');
@@ -1317,7 +1284,7 @@ export async function runVerify(options: {
         try {
             const key = await loadKeyMaterial(env);
             const clientUid = await readClientUid(options.config.dataDir);
-            const createAuth = deps.createAuth ?? (await loadCreateAuth());
+            const createAuth = deps.createAuth ?? createProtonAuth;
             const auth = await createAuth({ dataDir: options.config.dataDir, key, clientUid, logger, remoteFolderUid: options.config.remoteFolderUid });
             if (await auth.restore()) {
                 const listRemote = deps.listRemote ?? defaultListRemote;
@@ -1351,7 +1318,7 @@ export async function runVerify(options: {
     } else if (diverged === 0) {
         jsonLog(io, 'info', 'verify', `Clean: ${report.matched}/${report.checked} records match${remote === undefined ? ' (remote skipped)' : ''}${report.remoteUnverifiable > 0 ? `, ${report.remoteUnverifiable} remote paths unverifiable from metadata` : ''}.`);
     } else {
-        jsonLog(io, 'error', 'verify', `Diverged: ${diverged} paths differ from the state.`, output as Record<string, unknown>);
+        jsonLog(io, 'error', 'verify', `Diverged: ${diverged} paths differ from the state.`, output);
     }
     return diverged === 0 ? ExitCode.Ok : ExitCode.ItemFailures;
 }

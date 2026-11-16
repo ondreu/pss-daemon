@@ -164,7 +164,7 @@ describe('createProtonAuth', () => {
             logger: SILENT,
             fetchImpl: (async () => {
                 throw new Error('network call in restore');
-            }) as typeof fetch,
+            }),
         });
         assert.equal(await auth.restore(), false);
     });

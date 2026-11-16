@@ -141,7 +141,7 @@ export class NodeVaultAdapter implements DataAdapter {
     }
 
     async write(rel: string, data: string, options?: DataWriteOptions): Promise<void> {
-        await this.writeBinary(rel, new TextEncoder().encode(data).buffer as ArrayBuffer, options);
+        await this.writeBinary(rel, new TextEncoder().encode(data).buffer, options);
     }
 
     /**

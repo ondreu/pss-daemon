@@ -32,8 +32,7 @@ function nullEvents(): VaultEvents & { calls: string[] } {
 }
 
 const encoder = new TextEncoder();
-const decoder = new TextDecoder();
-const bytes = (text: string): ArrayBuffer => encoder.encode(text).buffer as ArrayBuffer;
+const bytes = (text: string): ArrayBuffer => encoder.encode(text).buffer;
 
 test('configDir passes through; close settles', async () => {
     const root = tempRoot();
@@ -71,7 +70,7 @@ test('getAbstractFileByPath mirrors the indexing rule', async () => {
             await adapter.writeBinary('sub/.hidden.md', bytes('h'));
             await adapter.mkdir('folder');
 
-            const lookup = vault.app.vault.getAbstractFileByPath!.bind(vault.app.vault);
+            const lookup = vault.app.vault.getAbstractFileByPath.bind(vault.app.vault);
             assert.ok(lookup('note.md') instanceof TFile, 'indexed file is a TFile');
             assert.equal(lookup('note.md')?.path, 'note.md');
             assert.ok(lookup('folder') instanceof TFolder, 'indexed folder is a TFolder');
@@ -100,22 +99,22 @@ test('copy, rename, createBinary and trashFile behave', async () => {
         try {
             const { app } = vault;
             const adapter = app.vault.adapter;
-            const lookup = app.vault.getAbstractFileByPath!.bind(app.vault);
+            const lookup = app.vault.getAbstractFileByPath.bind(app.vault);
 
-            const created = await app.vault.createBinary!('a.md', bytes('a'));
+            const created = await app.vault.createBinary('a.md', bytes('a'));
             assert.equal(created.path, 'a.md');
-            await assert.rejects(app.vault.createBinary!('a.md', bytes('again')), 'create over existing fails');
+            await assert.rejects(app.vault.createBinary('a.md', bytes('again')), 'create over existing fails');
 
             const file = lookup('a.md')!;
-            await app.vault.copy!(file, 'b.md');
+            await app.vault.copy(file, 'b.md');
             assert.equal(await adapter.read('b.md'), 'a');
-            await assert.rejects(app.vault.copy!(file, 'b.md'), 'copy over existing fails');
+            await assert.rejects(app.vault.copy(file, 'b.md'), 'copy over existing fails');
 
-            await app.vault.rename!(file, 'moved/a.md');
+            await app.vault.rename(file, 'moved/a.md');
             assert.equal(await adapter.exists('a.md'), false);
             assert.equal(await adapter.read('moved/a.md'), 'a');
 
-            await app.fileManager.trashFile!(lookup('moved/a.md')!);
+            await app.fileManager.trashFile(lookup('moved/a.md')!);
             assert.equal(await adapter.exists('moved/a.md'), false);
             assert.equal(await adapter.read('.trash/moved/a.md'), 'a');
             assert.equal(lookup('moved/a.md'), null);

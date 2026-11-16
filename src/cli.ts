@@ -66,7 +66,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
     const fail = (error: string): ParsedArgs => ({ ...parsed, error });
 
     while (i < argv.length) {
-        const arg = argv[i]!;
+        const arg = argv[i];
         if (arg === '--') {
             positional.push(...argv.slice(i + 1));
             break;
@@ -126,7 +126,7 @@ export function parseArgs(argv: string[]): ParsedArgs {
         return fail(`Too many commands: "${positional.join(' ')}".`);
     }
     if (positional.length === 1) {
-        const command = positional[0]!;
+        const command = positional[0];
         if (!(COMMANDS as string[]).includes(command)) {
             return fail(`Unknown command "${command}".`);
         }

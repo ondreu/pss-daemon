@@ -33,6 +33,7 @@ try {
         platform: 'node',
         target: 'node24',
         conditions: ['browser'],
+        define: { __PLUGIN_VERSION__: JSON.stringify('0.0.0-test'), __DAEMON_VERSION__: JSON.stringify('0.0.0-test') },
         outdir: outDir,
         outExtension: { '.js': '.cjs' },
         sourcemap: 'inline',

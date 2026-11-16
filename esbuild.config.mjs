@@ -27,6 +27,9 @@ import process from 'node:process';
 
 const production = process.argv[2] === 'production';
 const { version } = JSON.parse(readFileSync('./package.json', 'utf8'));
+// The session identifies itself to Proton with the plugin's version, so read it
+// from the manifest the release workflow stamps rather than from this package.
+const { version: pluginVersion } = JSON.parse(readFileSync('../manifest.json', 'utf8'));
 
 const banner = [
     '#!/usr/bin/env node',
@@ -34,6 +37,11 @@ const banner = [
     // See the comment above: the engine expects a browser-ish global.
     'globalThis.window ??= { setTimeout: (...a) => setTimeout(...a),' +
         ' clearTimeout: (t) => clearTimeout(t), crypto: globalThis.crypto };',
+    // `VaultIO` reaches for `window.require('fs')` to stream files above
+    // LARGE_FILE_BYTES instead of reading them whole. In Obsidian that is
+    // Electron's require; here it is Node's own, so the streaming path stays
+    // available and a 300 MB attachment cannot be pulled into memory at once.
+    'globalThis.window.require ??= (id) => require(id);',
 ].join('\n');
 
 await esbuild.build({
@@ -44,6 +52,7 @@ await esbuild.build({
     format: 'cjs',
     target: 'node24',
     conditions: ['browser'],
+    define: { __PLUGIN_VERSION__: JSON.stringify(pluginVersion), __DAEMON_VERSION__: JSON.stringify(version) },
     alias: { obsidian: path.resolve('../tests/stubs/obsidian.ts') },
     external: builtinModules,
     sourcemap: production ? false : 'inline',

@@ -126,7 +126,7 @@ function defaultFactory(
     onError: (error: Error) => void,
 ): DirWatcher {
     const watcher: FSWatcher = fsWatch(dirAbs, (eventType, filename) => {
-        listener(eventType as 'rename' | 'change', (filename as string | null) ?? null);
+        listener(eventType, (filename) ?? null);
     });
     watcher.on('error', onError);
     return watcher;

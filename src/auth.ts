@@ -139,8 +139,8 @@ export class HeadlessProtonAuth implements ProtonAuth {
             return { uid: root.uid, path: '' };
         }
         const segments = trimmed.split('/');
-        if (segments.length === 1 && UID_SHAPE.test(segments[0]!)) {
-            return this.resolveUid(drive, root.uid, segments[0]!);
+        if (segments.length === 1 && UID_SHAPE.test(segments[0])) {
+            return this.resolveUid(drive, root.uid, segments[0]);
         }
         for (const segment of segments) {
             if (segment === '' || segment === '.' || segment === '..') {
