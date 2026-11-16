@@ -14,7 +14,9 @@
         "build": "node esbuild.config.mjs production",
         "dev": "node esbuild.config.mjs",
         "check-types": "tsc --noEmit",
-        "test": "node scripts/test.mjs"
+        "test": "node scripts/test.mjs",
+        "test:integration": "node scripts/test-integration.mjs",
+        "chaos": "node scripts/chaos.mjs"
     },
     "dependencies": {
         "@protontech/crypto": "^2.2.0",
