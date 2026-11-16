@@ -9,17 +9,26 @@
  * `read`/`readBinary`, `writeBinary`, `mkdir`, `remove`, `rename`, `list`,
  * `copy`, `trashSystem`/`trashLocal` and `getFullPath`.
  *
- * Two properties matter more than coverage:
+ * Three properties matter more than coverage:
  *
  * - Writes are atomic. `writeBinary` lands in a temporary file in the same
  *   directory and is renamed over the target only after the bytes are flushed
- *   (`fsync`), so a crash or a `kill -9` leaves either the old content or the
- *   new content at the target path, never a mix. A rename that cannot happen
- *   on some platform is the one case `VaultIO` already handles by falling
- *   back to an in-place write; the temp file is removed either way.
+ *   (`fsync`), and the directory entry itself is flushed (`fsync` on the
+ *   directory fd) after the rename, so a crash between `rename` and
+ *   directory durability cannot lose a file the state later calls synced.
  * - No path escapes the vault. Every method goes through `checked()`, which
  *   applies the engine's own `staysInVault` rule a second time — the engine
  *   checks too, but this is the last line before the disk.
+ * - No symlink is ever followed. Every stat is an `lstat`: a symlink reads
+ *   as "refuse", never as its target. Listings skip links (outside bytes
+ *   must not enter the sync as vault files), reads of a link throw, and a
+ *   write over a link throws instead of replacing it — a download must never
+ *   silently destroy a user's link. See {@link SymlinkRefusedError}.
+ *
+ * Permission errors are never mistaken for absence: `stat`/`exists` swallow
+ * only `ENOENT`. An `EACCES`/`EPERM` propagates, and the daemon's pre-pass
+ * readability walk (see `daemon.ts`) refuses the pass before the engine can
+ * read an unreadable subtree as "everything deleted".
  *
  * Reads hold one buffer for the file being read and no more; large files are
  * the engine's decision (it streams over `LARGE_FILE_BYTES` only where the
@@ -33,9 +42,23 @@ import type { DataAdapter, DataWriteOptions, ListedFiles, Stat } from 'obsidian'
 import { staysInVault } from '../../src/sync/paths';
 
 /**
- * Faults a test may inject. The daemon never sets these; they exist so the
- * atomic-write guarantee can be proven without racing a real crash — for
- * example, by refusing the rename and asserting the old content survived.
+ * Thrown when a vault path resolves to a symlink. The daemon never follows
+ * links in either direction: reading one would upload outside bytes under a
+ * vault name, and writing over one would destroy the user's link.
+ */
+export class SymlinkRefusedError extends Error {
+    constructor(readonly rel: string) {
+        super(`Refusing to follow symlink at ${JSON.stringify(rel)}: symlinks are never synced`);
+        this.name = 'SymlinkRefusedError';
+    }
+}
+
+/**
+ * Faults and probes a test may inject. The daemon never sets `failRename`
+ * (it exists so the atomic-write guarantee can be proven without racing a
+ * real crash); `onDirSync` observes directory durability the same way, so a
+ * test can prove the rename-plus-dir-fsync path ran without pulling the
+ * power cord.
  */
 export type NodeAdapterFaults = {
     /**
@@ -44,9 +67,31 @@ export type NodeAdapterFaults = {
      * temporary file is removed and the target is left untouched.
      */
     failRename?: (targetRel: string) => boolean;
+    /** Called after the directory entry is flushed following a rename. */
+    onDirSync?: (dirAbs: string) => void;
 };
 
 let tempCounter = 0;
+
+/** True only for "no such file": every other errno propagates, never reads as absence. */
+function isNotFound(error: unknown): boolean {
+    return (error as NodeJS.ErrnoException).code === 'ENOENT';
+}
+
+/**
+ * Flush a directory entry so a just-renamed file survives a crash. Without
+ * this, the rename can reach the disk while the directory entry does not,
+ * and a file the state calls synced is gone after a power loss.
+ */
+export async function fsyncDir(dirAbs: string, onDirSync?: (dirAbs: string) => void): Promise<void> {
+    const dir = await fs.open(dirAbs, 'r');
+    try {
+        await dir.sync();
+    } finally {
+        await dir.close();
+    }
+    onDirSync?.(dirAbs);
+}
 
 export class NodeVaultAdapter implements DataAdapter {
     constructor(
@@ -75,6 +120,47 @@ export class NodeVaultAdapter implements DataAdapter {
     }
 
     /**
+     * Absolute path of a checked vault-relative path, refusing if the path
+     * or any ancestor below the root is a symlink. Every filesystem touch
+     * goes through here (directly or via `lstatChecked`), so a link can
+     * neither be read as its target nor smuggled past as a parent: writing
+     * into `link/note.md` would otherwise `mkdir -p` through the link and
+     * land outside the vault.
+     */
+    private async resolveChecked(checked: string): Promise<string> {
+        if (checked !== '') {
+            const segments = checked.split('/');
+            let prefix = '';
+            for (const segment of segments) {
+                prefix = prefix === '' ? segment : `${prefix}/${segment}`;
+                let st;
+                try {
+                    st = await fs.lstat(this.full(prefix));
+                } catch (error) {
+                    if (isNotFound(error)) {
+                        // Nothing below a missing path can be a link.
+                        break;
+                    }
+                    throw error;
+                }
+                if (st.isSymbolicLink()) {
+                    throw new SymlinkRefusedError(prefix);
+                }
+            }
+        }
+        return this.full(checked);
+    }
+
+    /** `lstat`, so a symlink never reads as its target. Throws on links. */
+    private async lstatChecked(checked: string): Promise<Awaited<ReturnType<typeof fs.lstat>>> {
+        const st = await fs.lstat(await this.resolveChecked(checked));
+        if (st.isSymbolicLink()) {
+            throw new SymlinkRefusedError(checked);
+        }
+        return st;
+    }
+
+    /**
      * Absolute path on disk, when the caller asks. `VaultIO` uses this for
      * its streaming and `statSync` fast paths wherever the platform offers
      * them; without it everything still works through the adapter methods.
@@ -93,10 +179,19 @@ export class NodeVaultAdapter implements DataAdapter {
             return true;
         }
         try {
-            await fs.stat(this.full(checked));
+            await this.lstatChecked(checked);
             return true;
-        } catch {
-            return false;
+        } catch (error) {
+            if (error instanceof SymlinkRefusedError) {
+                throw error;
+            }
+            // Only "no such file" reads as absent. Anything else —
+            // EACCES, EPERM, ENOTDIR — propagates, so an unreadable path
+            // never reads as a deleted one.
+            if (isNotFound(error)) {
+                return false;
+            }
+            throw error;
         }
     }
 
@@ -104,9 +199,15 @@ export class NodeVaultAdapter implements DataAdapter {
         const checked = this.checked(rel);
         let st;
         try {
-            st = await fs.stat(checked === '' ? this.root : this.full(checked));
-        } catch {
-            return null;
+            st = await fs.lstat(checked === '' ? this.root : await this.resolveChecked(checked));
+        } catch (error) {
+            if (isNotFound(error)) {
+                return null;
+            }
+            throw error;
+        }
+        if (st.isSymbolicLink()) {
+            throw new SymlinkRefusedError(checked);
         }
         return {
             type: st.isFile() ? 'file' : 'folder',
@@ -118,25 +219,40 @@ export class NodeVaultAdapter implements DataAdapter {
 
     async list(rel: string): Promise<ListedFiles> {
         const checked = this.checked(rel);
+        if (checked !== '') {
+            // Refuse a linked directory (and a linked ancestor) before
+            // readdir can follow it: its outside files must never enumerate
+            // as vault paths.
+            await this.lstatChecked(checked);
+        }
         const entries = await fs.readdir(checked === '' ? this.root : this.full(checked), {
             withFileTypes: true,
         });
         const prefix = checked === '' ? '' : `${checked}/`;
+        // Symlinks are skipped, never followed: a linked directory's outside
+        // files must not enter the sync as vault paths, and a linked file's
+        // target bytes must never be uploaded (reads refuse links outright,
+        // so a link that survived listing would fail the pass loudly anyway).
+        const visible = entries.filter((entry) => !entry.isSymbolicLink());
         return {
-            files: entries.filter((entry) => entry.isFile()).map((entry) => prefix + entry.name),
-            folders: entries.filter((entry) => entry.isDirectory()).map((entry) => prefix + entry.name),
+            files: visible.filter((entry) => entry.isFile()).map((entry) => prefix + entry.name),
+            folders: visible.filter((entry) => entry.isDirectory()).map((entry) => prefix + entry.name),
         };
     }
 
     async read(rel: string): Promise<string> {
-        return await fs.readFile(this.full(this.checked(rel)), 'utf8');
+        const checked = this.checked(rel);
+        await this.lstatChecked(checked);
+        return await fs.readFile(await this.resolveChecked(checked), 'utf8');
     }
 
     async readBinary(rel: string): Promise<ArrayBuffer> {
+        const checked = this.checked(rel);
         // One buffer for the file, sliced off the pool's backing store so no
         // caller can scribble on a neighbour. The engine only reads whole
         // files below its large-file threshold; above it, it streams.
-        const data = await fs.readFile(this.full(this.checked(rel)));
+        await this.lstatChecked(checked);
+        const data = await fs.readFile(await this.resolveChecked(checked));
         return data.buffer.slice(data.byteOffset, data.byteOffset + data.byteLength);
     }
 
@@ -146,9 +262,10 @@ export class NodeVaultAdapter implements DataAdapter {
 
     /**
      * Write bytes atomically: fully written and flushed to a temporary file
-     * beside the target, then renamed over it. Until the rename, the target
-     * holds its old content; after it, the new content. No partial file is
-     * ever visible at the target path.
+     * beside the target, then renamed over it, then the directory entry
+     * flushed. Until the rename, the target holds its old content; after the
+     * rename *and* the directory sync, the new content is durable. No partial
+     * file is ever visible at the target path.
      *
      * The temporary name carries the `.proton-sync.tmp` suffix with a leading
      * dot, matching the pattern the engine already sweeps (`VaultIO` removes
@@ -158,7 +275,10 @@ export class NodeVaultAdapter implements DataAdapter {
      */
     async writeBinary(rel: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
         const checked = this.checked(rel);
-        const target = this.full(checked);
+        // Throws when the target or any ancestor is a link: a download must
+        // not silently replace a user's link, and mkdir -p through a linked
+        // parent would land outside the vault.
+        const target = await this.resolveChecked(checked);
         await fs.mkdir(path.dirname(target), { recursive: true });
         const temp = path.join(
             path.dirname(target),
@@ -187,6 +307,9 @@ export class NodeVaultAdapter implements DataAdapter {
                 throw new Error(`Injected fault: refusing to rename into ${JSON.stringify(checked)}`);
             }
             await fs.rename(temp, target);
+            // Flushed after the rename, or a crash can lose a file the state
+            // already calls synced. Same-directory only: cheap, one syscall.
+            await fsyncDir(path.dirname(target), this.faults.onDirSync);
         } catch (error) {
             await fs.unlink(temp).catch(() => undefined);
             throw error;
@@ -194,7 +317,7 @@ export class NodeVaultAdapter implements DataAdapter {
     }
 
     async append(rel: string, data: string, options?: DataWriteOptions): Promise<void> {
-        const target = this.full(this.checked(rel));
+        const target = await this.resolveChecked(this.checked(rel));
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.appendFile(target, data, 'utf8');
         if (options?.mtime !== undefined) {
@@ -203,7 +326,7 @@ export class NodeVaultAdapter implements DataAdapter {
     }
 
     async appendBinary(rel: string, data: ArrayBuffer, options?: DataWriteOptions): Promise<void> {
-        const target = this.full(this.checked(rel));
+        const target = await this.resolveChecked(this.checked(rel));
         await fs.mkdir(path.dirname(target), { recursive: true });
         await fs.appendFile(target, new Uint8Array(data));
         if (options?.mtime !== undefined) {
@@ -222,7 +345,7 @@ export class NodeVaultAdapter implements DataAdapter {
     }
 
     async mkdir(rel: string): Promise<void> {
-        await fs.mkdir(this.full(this.checked(rel)), { recursive: true });
+        await fs.mkdir(await this.resolveChecked(this.checked(rel)), { recursive: true });
     }
 
     /**
@@ -239,11 +362,15 @@ export class NodeVaultAdapter implements DataAdapter {
     /**
      * Move the path into `.trash/` at the vault root, preserving its shape
      * below it. A name already taken there gets a numeric suffix rather than
-     * overwriting — trash that eats trash is not trash.
+     * overwriting — trash that eats trash is not trash. Moving the link
+     * itself is safe (no bytes cross the vault boundary); the daemon is a
+     * single writer, so check-then-rename is enough.
      */
     async trashLocal(rel: string): Promise<void> {
         const checked = this.checked(rel);
-        const source = this.full(checked);
+        // A link source is refused rather than moved: the engine never asks
+        // for one (reads refuse links first), so this is always a surprise.
+        const source = await this.resolveChecked(checked);
         // A name already taken in the trash gets a numeric suffix rather than
         // overwriting — trash that eats trash is not trash. The daemon is a
         // single writer, so check-then-rename is enough; nothing else creates
@@ -254,10 +381,13 @@ export class NodeVaultAdapter implements DataAdapter {
             destRel = `.trash/${checked}.${attempt}`;
         }
         await fs.rename(source, this.full(destRel));
+        await fsyncDir(path.dirname(this.full(destRel)), this.faults.onDirSync);
     }
 
     async rmdir(rel: string, recursive: boolean): Promise<void> {
-        const target = this.full(this.checked(rel));
+        // resolveChecked already refused links (final or ancestor): only a
+        // real directory reaches the removal below, never a link target.
+        const target = await this.resolveChecked(this.checked(rel));
         if (recursive) {
             await fs.rm(target, { recursive: true });
         } else {
@@ -267,12 +397,19 @@ export class NodeVaultAdapter implements DataAdapter {
 
     async remove(rel: string): Promise<void> {
         const checked = this.checked(rel);
-        const target = this.full(checked);
+        let target: string;
         let st;
         try {
-            st = await fs.stat(target);
-        } catch {
-            throw new Error(`ENOENT: no such file or folder: ${JSON.stringify(checked)}`);
+            // resolveChecked refuses links; the lstat below only tells files
+            // from directories. Missing reads as the adapter's ENOENT either
+            // way, never as silent success.
+            target = await this.resolveChecked(checked);
+            st = await fs.lstat(target);
+        } catch (error) {
+            if (isNotFound(error)) {
+                throw new Error(`ENOENT: no such file or folder: ${JSON.stringify(checked)}`);
+            }
+            throw error;
         }
         if (st.isDirectory()) {
             await fs.rm(target, { recursive: true });
@@ -282,21 +419,32 @@ export class NodeVaultAdapter implements DataAdapter {
     }
 
     async rename(oldRel: string, newRel: string): Promise<void> {
-        const from = this.full(this.checked(oldRel));
-        const to = this.full(this.checked(newRel));
+        const checkedFrom = this.checked(oldRel);
+        const checkedTo = this.checked(newRel);
+        // Neither side may be (or sit below) a link: the source move stays
+        // inside the vault, and the destination is never a link silently
+        // replaced.
+        const from = await this.resolveChecked(checkedFrom);
+        const to = await this.resolveChecked(checkedTo);
         await fs.mkdir(path.dirname(to), { recursive: true });
         await fs.rename(from, to);
+        await fsyncDir(path.dirname(to), this.faults.onDirSync);
     }
 
     /**
      * Copy bytes without reading them into memory. Overwrites like the
      * filesystem does; the Vault-level `copy` — the one the engine calls for
      * indexed files — refuses an existing destination first, matching
-     * Obsidian, which fails the copy instead.
+     * Obsidian, which fails the copy instead. A symlink source is refused:
+     * copying would upload the link target's bytes as a vault file.
      */
     async copy(oldRel: string, newRel: string): Promise<void> {
-        const from = this.full(this.checked(oldRel));
-        const to = this.full(this.checked(newRel));
+        const checkedFrom = this.checked(oldRel);
+        const checkedTo = this.checked(newRel);
+        await this.lstatChecked(checkedFrom);
+        // A linked destination is refused, never replaced.
+        const to = await this.resolveChecked(checkedTo);
+        const from = await this.resolveChecked(checkedFrom);
         await fs.mkdir(path.dirname(to), { recursive: true });
         await fs.copyFile(from, to);
     }

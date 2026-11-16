@@ -5,11 +5,12 @@
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync } from 'node:fs';
+import { chmod, mkdir, readlink, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { NodeVaultAdapter } from '../src/nodeAdapter';
+import { NodeVaultAdapter, SymlinkRefusedError } from '../src/nodeAdapter';
 
 function tempRoot(): string {
     return mkdtempSync(path.join(tmpdir(), 'pss-adapter-'));
@@ -183,6 +184,104 @@ test('text write, append and process roundtrip', async () => {
         const next = await adapter.process('n.md', (data) => data.toUpperCase());
         assert.equal(next, 'ONE TWO');
         assert.equal(await adapter.read('n.md'), 'ONE TWO');
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('EACCES never reads as "gone": stat/exists/list rethrow', async () => {
+    const root = tempRoot();
+    try {
+        const adapter = new NodeVaultAdapter(root);
+        await mkdir(path.join(root, 'sub'));
+        await adapter.writeBinary('sub/secret.md', bytes('secret'));
+        await adapter.writeBinary('top.md', bytes('top'));
+        await chmod(path.join(root, 'sub'), 0o000);
+        try {
+            await assert.rejects(adapter.stat('sub/secret.md'), /EACCES/);
+            await assert.rejects(adapter.exists('sub/secret.md'), /EACCES/);
+            await assert.rejects(adapter.list('sub'), /EACCES/);
+        } finally {
+            await chmod(path.join(root, 'sub'), 0o700);
+        }
+        // Readable again: the files were there all along.
+        assert.equal(await adapter.read('sub/secret.md'), 'secret');
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('ENOTDIR never reads as absence', async () => {
+    const root = tempRoot();
+    try {
+        const adapter = new NodeVaultAdapter(root);
+        await adapter.writeBinary('file.md', bytes('x'));
+        await assert.rejects(adapter.exists('file.md/deeper.md'), /ENOTDIR/);
+        await assert.rejects(adapter.stat('file.md/deeper.md'), /ENOTDIR/);
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('symlinks are refused, never followed, and never replaced', async () => {
+    const root = tempRoot();
+    const outside = tempRoot();
+    try {
+        const adapter = new NodeVaultAdapter(root);
+        await writeFile(path.join(outside, 'outside.md'), 'outside bytes');
+        await mkdir(path.join(outside, 'dir'));
+        await writeFile(path.join(outside, 'dir', 'inner.md'), 'inner bytes');
+        await symlink(path.join(outside, 'outside.md'), path.join(root, 'link.md'));
+        await symlink(path.join(outside, 'dir'), path.join(root, 'linkdir'));
+        await adapter.writeBinary('real.md', bytes('real'));
+
+        // Direct reads refuse instead of returning the target's bytes.
+        await assert.rejects(adapter.stat('link.md'), SymlinkRefusedError);
+        await assert.rejects(adapter.exists('link.md'), SymlinkRefusedError);
+        await assert.rejects(adapter.read('link.md'), SymlinkRefusedError);
+        await assert.rejects(adapter.readBinary('link.md'), SymlinkRefusedError);
+        await assert.rejects(adapter.list('linkdir'), SymlinkRefusedError);
+
+        // Listings skip links: outside names must never enumerate as vault paths.
+        const top = await adapter.list('');
+        assert.ok(!top.files.includes('link.md'), `link listed: ${top.files}`);
+        assert.ok(!top.folders.includes('linkdir'), `linked dir listed: ${top.folders}`);
+
+        // A write under a linked parent would mkdir -p through the link and
+        // land outside the vault: refused before anything is created.
+        await assert.rejects(adapter.writeBinary('linkdir/note.md', bytes('escape')), SymlinkRefusedError);
+        await assert.rejects(adapter.mkdir('linkdir/sub'), SymlinkRefusedError);
+        assert.equal((await import('node:fs')).existsSync(path.join(outside, 'dir', 'note.md')), false);
+
+        // A download over a user's link must not silently replace it.
+        await assert.rejects(adapter.writeBinary('link.md', bytes('replacement')), SymlinkRefusedError);
+        await assert.rejects(adapter.copy('real.md', 'link.md'), SymlinkRefusedError);
+        assert.equal(await readlink(path.join(root, 'link.md')), path.join(outside, 'outside.md'));
+
+        // Copying from a link would upload the target's bytes as a vault file.
+        await assert.rejects(adapter.copy('link.md', 'copy.md'), SymlinkRefusedError);
+
+        // Removing a link removes nothing outside it (refused outright here).
+        await assert.rejects(adapter.remove('link.md'), SymlinkRefusedError);
+        await assert.rejects(adapter.rename('link.md', 'moved.md'), SymlinkRefusedError);
+        assert.equal(await readlink(path.join(root, 'link.md')), path.join(outside, 'outside.md'));
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(outside, { recursive: true, force: true });
+    }
+});
+
+test('writeBinary and rename flush the directory: the probe observes it', async () => {
+    const root = tempRoot();
+    try {
+        const synced: string[] = [];
+        const adapter = new NodeVaultAdapter(root, { onDirSync: (dir) => synced.push(dir) });
+        await adapter.writeBinary('sub/note.md', bytes('x'));
+        assert.deepEqual(synced, [path.join(root, 'sub')]);
+        synced.length = 0;
+        await adapter.rename('sub/note.md', 'sub/renamed.md');
+        assert.deepEqual(synced, [path.join(root, 'sub')]);
+        assert.equal(await adapter.read('sub/renamed.md'), 'x');
     } finally {
         rmSync(root, { recursive: true, force: true });
     }
