@@ -256,7 +256,11 @@ export const createProtonAuth: CreateProtonAuth = async (options) => {
     await mkdir(options.dataDir, { recursive: true, mode: 0o700 });
     const logger = options.logger.getLogger('auth');
     const slot = new FileSlot(join(options.dataDir, SESSION_FILE_NAME), options.key);
-    const cacheStore = new FileCacheStore(join(options.dataDir, CACHE_FILE_NAME), logger);
+    // `memory` keeps the encrypted node cache in the process only: the
+    // session falls back to an in-memory cache when no store is supplied
+    // (IndexedDB, the plugin's store, does not exist server-side), so no
+    // cache file is ever written. `file` persists it like the plugin does.
+    const cacheStore = options.metadataCache === 'memory' ? null : new FileCacheStore(join(options.dataDir, CACHE_FILE_NAME), logger);
     const credentials = new Credentials(
         slot,
         {

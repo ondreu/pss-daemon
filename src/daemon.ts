@@ -14,7 +14,7 @@
  * breaks the build instead of showing up as a runtime "seam" error.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readdir, readFile, stat, writeFile } from 'node:fs/promises';
+import { lstat, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { ProtonDriveClient } from '@protontech/drive-sdk';
@@ -29,10 +29,11 @@ import { SyncState } from '../../src/sync/state';
 import type { SyncRecord } from '../../src/sync/types';
 import { Logger } from '../../src/util/logger';
 import { createProtonAuth } from './auth';
-import { ensureDaemonDirs, loadKeyMaterial, vaultLockFile } from './config';
+import { ConfigError, ensureDaemonDirs, loadKeyMaterial, vaultLockFile } from './config';
 import { createHeadlessVault } from './headlessApp';
 import { acquireDaemonLocks, LockHeldError, releaseLocks, type DaemonLock, type LockProbe } from './lock';
 import { emptyHealth, writeHealthFile, type DaemonState, type HealthFile } from './health';
+import { fsyncDir } from './nodeAdapter';
 import type { CreateHeadlessVault, CreateProtonAuth, HeadlessVault } from './ports';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from './types';
 
@@ -48,6 +49,11 @@ export type SessionLike = {
     validateCache(fingerprint: string): Promise<void>;
     flushCache(): Promise<void>;
     setSessionEndedHandler(handler: (() => void) | null): void;
+    /**
+     * Scope the saved Drive cache to nodes the vault syncs; see
+     * `ProtonSession.setNodeSource`. Absent on test fakes that have no cache.
+     */
+    setNodeSource?(source: (() => Set<string>) | null): void;
 };
 
 /** The slice of `ProtonAuth` the daemon touches. */
@@ -56,6 +62,11 @@ export type AuthLike = {
     restore(): Promise<boolean>;
     login(onUrl: (url: string) => void, signal?: AbortSignal): Promise<void>;
     signOut(): Promise<void>;
+    /**
+     * Point the saved cache's marker at the sync state's event position; see
+     * `HeadlessProtonAuth.setCacheMarker`. Absent on test fakes.
+     */
+    setCacheMarker?(source: () => string): void;
 };
 
 /** The slice of `SyncState` the daemon touches. */
@@ -147,15 +158,33 @@ export function jsonLog(io: DaemonIO, level: string, module: string, message: st
  * adapter is rooted at the vault and cannot address the data dir (which
  * must never be inside the vault), so the state gets five file ops over
  * absolute paths instead. Writes go through temp-plus-rename, mirroring
- * what `SyncState` itself does one layer up.
+ * what `SyncState` itself does one layer up. Exported for tests: the
+ * directory-durability guarantee below is proven against this class.
+ *
+ * The data dir must be host-local (like the lock assumes): temp names are
+ * pid-scoped, and two machines sharing one data dir would trade device ids
+ * and clobber each other's state. Nothing here protects against that
+ * layout; the config validation only refuses the vault itself.
  */
-class DataDirAdapter {
+export class DataDirAdapter {
+    /**
+     * @param onDirSync Observes directory durability in tests: called with
+     * the directory flushed after a rename, proving the crash window between
+     * rename and durability is closed.
+     */
+    constructor(private readonly onDirSync?: (dirAbs: string) => void) {}
+
     async exists(filePath: string): Promise<boolean> {
         try {
             await stat(filePath);
             return true;
-        } catch {
-            return false;
+        } catch (error) {
+            // Only "no such file" reads as absent — an unreadable state dir
+            // must fail the start, never read as a first sync.
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                return false;
+            }
+            throw error;
         }
     }
 
@@ -163,22 +192,36 @@ class DataDirAdapter {
         return readFile(filePath, 'utf8');
     }
 
+    /**
+     * Temp-plus-rename with the file flushed before the rename and the
+     * directory flushed after it. A crash between the rename and directory
+     * durability cannot leave a file the state calls synced missing: the
+     * entry is durable before this returns, and the state's own flush (which
+     * marks the file synced) goes through this same path afterwards — so a
+     * crash in between replays the download on the next pass instead of
+     * reading a present record for an absent file (which would delete-remote).
+     */
     async write(filePath: string, text: string): Promise<void> {
         await mkdir(path.dirname(filePath), { recursive: true });
         const tmp = `${filePath}.${process.pid}.tmp`;
         await writeFile(tmp, text, 'utf8');
-        const { rename } = await import('node:fs/promises');
+        const handle = await open(tmp, 'r');
+        try {
+            await handle.sync();
+        } finally {
+            await handle.close();
+        }
         await rename(tmp, filePath);
+        await fsyncDir(path.dirname(filePath), this.onDirSync);
     }
 
     async remove(filePath: string): Promise<void> {
-        const { unlink } = await import('node:fs/promises');
         await unlink(filePath);
     }
 
     async rename(oldPath: string, newPath: string): Promise<void> {
-        const { rename } = await import('node:fs/promises');
         await rename(oldPath, newPath);
+        await fsyncDir(path.dirname(newPath), this.onDirSync);
     }
 }
 
@@ -270,6 +313,73 @@ export async function readClientUid(dataDir: string): Promise<string> {
     await mkdir(dataDir, { recursive: true });
     await writeFile(file, created + '\n', 'utf8');
     return created;
+}
+
+/**
+ * Refuse a pass the vault cannot be fully read for. A `chmod 000`
+ * subdirectory (or an ACL/ownership slip) reads as "everything under it
+ * deleted" to the engine, which then returns `delete-remote` for every
+ * tracked file inside — with no hold, no conflict and no alert. So before
+ * the engine starts, walk the whole tree with `lstat`: anything but
+ * `ENOENT` (a path that vanished mid-walk, which the engine's own scan
+ * settles) refuses the pass with a clear error and zero Drive writes.
+ *
+ * The same walk collects symlinks. An untracked link is skipped by the
+ * watcher and the adapter, but a *tracked* path that is (or sits below) a
+ * link would read as locally deleted and likewise delete-remote — so a
+ * tracked link refuses the pass too, instead of losing the remote copy.
+ */
+export async function assertVaultSyncable(vaultPath: string, trackedPaths: string[]): Promise<void> {
+    const links: string[] = [];
+    const queue: Array<{ abs: string; rel: string }> = [{ abs: vaultPath, rel: '' }];
+    while (queue.length > 0) {
+        const current = queue.pop()!;
+        let entries;
+        try {
+            entries = await readdir(current.abs, { withFileTypes: true });
+        } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                continue;
+            }
+            throw new Error(
+                `Cannot list "${current.rel === '' ? vaultPath : current.rel}": ${error instanceof Error ? error.message : String(error)}. Refusing the pass rather than reading an unreadable subtree as deleted.`,
+            );
+        }
+        for (const entry of entries) {
+            const rel = current.rel === '' ? entry.name : `${current.rel}/${entry.name}`;
+            if (entry.isSymbolicLink()) {
+                links.push(rel);
+                continue;
+            }
+            const abs = path.join(current.abs, entry.name);
+            let st;
+            try {
+                st = await lstat(abs);
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                    continue;
+                }
+                throw new Error(
+                    `Cannot stat "${rel}": ${error instanceof Error ? error.message : String(error)}. Refusing the pass rather than reading an unreadable path as deleted.`,
+                );
+            }
+            if (st.isSymbolicLink()) {
+                links.push(rel);
+                continue;
+            }
+            if (st.isDirectory()) {
+                queue.push({ abs, rel });
+            }
+        }
+    }
+    for (const tracked of trackedPaths) {
+        const hit = links.find((link) => tracked === link || tracked.startsWith(`${link}/`));
+        if (hit !== undefined) {
+            throw new Error(
+                `Tracked path "${tracked}" is or sits below symlink "${hit}": symlinks are never synced. Refusing the pass rather than deleting the remote copy.`,
+            );
+        }
+    }
 }
 
 /** Daemon `PluginSettings`: the plugin's defaults, narrowed to unattended operation. */
@@ -418,7 +528,12 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
             await writeHealth({ state: 'error', error: error.message });
             return { exitCode: ExitCode.AlreadyRunning };
         }
-        throw error;
+        // A lock that cannot be created (a read-only mount, a dead data dir)
+        // is a configuration problem, not an internal error: exit 7 so the
+        // runbook can key off it. The vault path is named, never key bytes.
+        throw new ConfigError(
+            `Cannot hold the daemon lock: ${error instanceof Error ? error.message : String(error)}. Check that the data dir and the vault mount are writable.`,
+        );
     }
 
     const cleanup = async (): Promise<void> => {
@@ -434,12 +549,13 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
         onFirst: () => stopEngine(),
     });
 
+    let engineRef: EngineLike | null = null;
+    let sessionEnded = false;
+    let vaultRef: HeadlessVault | null = null;
     try {
         const key = await loadKeyMaterial(env);
         const clientUid = await readClientUid(config.dataDir);
 
-        let engineRef: EngineLike | null = null;
-        let sessionEnded = false;
         stopEngine = () => {
             void engineRef?.stop().catch(() => undefined);
         };
@@ -456,9 +572,10 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
             },
             ...(request.autoSync ? { rescanSeconds: 900 } : {}),
         });
+        vaultRef = vault;
 
         const createAuth = deps.createAuth ?? createProtonAuth;
-        const auth = await createAuth({ dataDir: config.dataDir, key, clientUid, logger, remoteFolderUid: config.remoteFolderUid });
+        const auth: AuthLike = await createAuth({ dataDir: config.dataDir, key, clientUid, logger, remoteFolderUid: config.remoteFolderUid, metadataCache: config.metadataCache });
         let restored: boolean;
         try {
             restored = await auth.restore();
@@ -550,6 +667,11 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
         } else {
             await auth.session.validateCache(state.cursorsFingerprint());
         }
+        // Point the saved Drive cache's marker at this state's event
+        // position, as auth.ts prescribes once the state exists. Without
+        // this the marker stays '' and the next start's validateCache
+        // clears a cache that was perfectly current.
+        auth.setCacheMarker?.(() => state.cursorsFingerprint());
 
         const client = auth.session.getClient();
         const rootUid = config.remoteFolderUid;
@@ -574,6 +696,28 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
             await cleanup();
             return { exitCode: ExitCode.SignedOut };
         }
+
+        // Port of main.ts rememberCacheParents/cacheScopeNodes: the saved
+        // Drive cache may keep entries only for nodes the vault syncs, plus
+        // the synced folder and the folders above it (read on every start
+        // but recorded nowhere in the state). Parents are best effort — a
+        // listing failure only costs requests, never correctness — while the
+        // state's own uids are the scope that matters.
+        const cacheParents = new Set<string>([rootUid]);
+        try {
+            for (const node of await client.getNodeHierarchy(rootUid)) {
+                cacheParents.add(node.uid);
+            }
+        } catch (error) {
+            logger.debug('Could not list the folders above the synced one for the Drive cache scope', error);
+        }
+        auth.session.setNodeSource?.(() => {
+            const uids = new Set<string>(state.entries().map((record) => record.nodeUid));
+            for (const uid of cacheParents) {
+                uids.add(uid);
+            }
+            return uids;
+        });
 
         // First sync of two non-empty sides: refuse until told which side
         // wins, exactly like the plugin's first-sync modal. With an
@@ -605,8 +749,33 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
                 if (override !== undefined) {
                     engine.updateSettings({ ...settings, conflictPolicy: override });
                 }
+                if ((request.pairing ?? null) === null && config.pairing !== null) {
+                    // The gate was satisfied by a value left in daemon.json,
+                    // not by a fresh flag on this command. A config kept from
+                    // provisioning (or from a `login --pairing` long ago) can
+                    // auto-resolve a first sync nobody decided on just now —
+                    // safe direction today (an empty state cannot produce
+                    // removals), but worth saying aloud.
+                    jsonLog(io, 'warn', 'pairing', `First sync proceeds with pairing=${effective} from daemon.json, not from a --pairing flag on this command.`);
+                }
                 jsonLog(io, 'warn', 'pairing', `First sync with pairing=${effective}`, { policy: override ?? settings.conflictPolicy });
             }
+        }
+
+        // Last gate: the vault must be fully readable, with no tracked path
+        // hidden behind an unreadable directory or a symlink. The engine
+        // reads either as "locally deleted" and deletes the remote copy, so
+        // the pass is refused here — with zero Drive writes — instead.
+        try {
+            await assertVaultSyncable(config.vaultPath, state.paths());
+        } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            jsonLog(io, 'error', 'vault', message);
+            await writeHealth({ state: 'error', error: message });
+            state.close();
+            await vault.close().catch(() => undefined);
+            await cleanup();
+            return { exitCode: ExitCode.ItemFailures };
         }
 
         return {
@@ -633,6 +802,12 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
         const message = error instanceof Error ? error.message : String(error);
         jsonLog(io, 'error', 'daemon', `Startup failed: ${message}`);
         await writeHealth({ state: 'error', error: message }).catch(() => undefined);
+        // The vault (and its filesystem watcher) may already exist while the
+        // engine never started: close it here, or a failed boot leaks the
+        // watcher's inotify instances until the process exits.
+        if (vaultRef !== null) {
+            await vaultRef.close().catch(() => undefined);
+        }
         await cleanup();
         throw error;
     }
@@ -663,6 +838,12 @@ export type RunDaemonOptions = {
     exit?: (code: number) => void;
     /** Heartbeat period in watch mode; shortened in tests. */
     heartbeatMs?: number;
+    /**
+     * How long without engine progress before the heartbeat stops pretending
+     * all is well; shortened in tests. Defaults to twice the Drive poll
+     * interval, matching the test plan's stall bound.
+     */
+    stallAfterMs?: number;
 };
 
 function summarizeExit(summary: SyncSummary): ExitCode {
@@ -722,8 +903,10 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
 
         if (options.mode === 'once') {
             // A signal mid-pass drains the engine and lands here as an
-            // interruption, not a failure: the supervisor asked us to stop,
-            // and stop() already flushed the state.
+            // interruption: the supervisor asked us to stop, and stop()
+            // already flushed the state. Returning 0 would report "in sync"
+            // for a pass that never finished, so an interruption is an item
+            // failure — retryable, but never clean.
             let interrupted = false;
             boot.uninstallSignals();
             const uninstallOnce = installShutdownHandlers({
@@ -741,11 +924,18 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
                 if (interrupted || boot.sessionEnded()) {
                     await boot.writeHealth({ state: boot.sessionEnded() ? 'signed-out' : 'stopped', error: null }).catch(() => undefined);
                     await shutdownBoot(boot);
-                    return boot.sessionEnded() ? ExitCode.SignedOut : ExitCode.Ok;
+                    return boot.sessionEnded() ? ExitCode.SignedOut : ExitCode.ItemFailures;
                 }
                 throw error;
             }
             uninstallOnce();
+            if (interrupted && !boot.sessionEnded()) {
+                // The engine settled after the signal instead of throwing:
+                // the pass still did not finish, so it is not clean either.
+                await boot.writeHealth({ state: 'stopped', error: 'Interrupted before the pass finished.' }).catch(() => undefined);
+                await shutdownBoot(boot);
+                return ExitCode.ItemFailures;
+            }
             if (boot.sessionEnded()) {
                 jsonLog(io, 'error', 'auth', 'The Proton session ended during the pass; not retrying without a human.');
                 await boot.writeHealth({ state: 'signed-out', error: 'The Proton session ended.' });
@@ -817,6 +1007,22 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
         });
 
         const heartbeatMs = options.heartbeatMs ?? 30_000;
+        // Stall detection pins the Drive poll interval: a wedged engine must
+        // read as stale within two polls, never as healthy forever.
+        const stallAfterMs = options.stallAfterMs ?? 2 * boot.config.remotePollSeconds * 1000;
+        const fingerprint = (summary: SyncSummary): string =>
+            JSON.stringify({
+                status: summary.status,
+                lastSyncedAt: summary.lastSyncedAt,
+                pending: summary.pending,
+                conflicts: summary.conflicts,
+                progressFraction: summary.progressFraction,
+                progress: summary.progress,
+                massDelete: summary.pendingMassDelete?.count ?? 0,
+            });
+        let lastFingerprint = fingerprint(boot.engine.getSummary());
+        let lastProgressAt = Date.now();
+        let stallNoted = false;
         const heartbeat = setInterval(() => {
             void (async () => {
                 if (boot.sessionEnded()) {
@@ -824,13 +1030,27 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
                     return;
                 }
                 const current = boot.engine.getSummary();
-                await boot.writeHealth({
-                    state: current.pendingMassDelete !== undefined ? 'mass-delete-held' : mapEngineStatus(current.status),
-                    lastSummary: current,
-                    pendingConflicts: current.conflicts,
-                    massDeleteHeld: current.pendingMassDelete?.paths ?? [],
-                    error: current.lastError,
-                }).catch(() => undefined);
+                if (fingerprint(current) !== lastFingerprint) {
+                    // Progress: the heartbeat is earned, and the stall clock restarts.
+                    lastFingerprint = fingerprint(current);
+                    lastProgressAt = Date.now();
+                    stallNoted = false;
+                    await boot.writeHealth({
+                        state: current.pendingMassDelete !== undefined ? 'mass-delete-held' : mapEngineStatus(current.status),
+                        lastSummary: current,
+                        pendingConflicts: current.conflicts,
+                        massDeleteHeld: current.pendingMassDelete?.paths ?? [],
+                        error: current.lastError,
+                    }).catch(() => undefined);
+                    return;
+                }
+                // No progress: withhold the write so freshness expires, and
+                // say so once — the supervisor, not a fresh timestamp, is
+                // what notices a wedged engine.
+                if (!stallNoted && Date.now() - lastProgressAt >= stallAfterMs) {
+                    stallNoted = true;
+                    jsonLog(io, 'warn', 'daemon', `No sync progress for ${Math.round((Date.now() - lastProgressAt) / 1000)}s; the engine looks stalled, letting health go stale.`);
+                }
             })();
         }, heartbeatMs);
 
@@ -873,6 +1093,8 @@ export async function runMassDecision(options: {
     config: DaemonConfig;
     paths: DaemonPaths;
     approve: boolean;
+    /** First-sync winner for this run; falls back to the config file. */
+    pairing?: string | null;
     deps?: DaemonDeps;
     io?: DaemonIO;
     env?: NodeJS.ProcessEnv;
@@ -991,7 +1213,9 @@ export async function runLogin(options: {
             jsonLog(io, 'error', 'lock', error.message);
             return ExitCode.AlreadyRunning;
         }
-        throw error;
+        throw new ConfigError(
+            `Cannot hold the daemon lock: ${error instanceof Error ? error.message : String(error)}. Check that the data dir and the vault mount are writable.`,
+        );
     }
 
     try {
@@ -1097,7 +1321,9 @@ export async function runSignOut(options: {
             jsonLog(io, 'error', 'lock', `The daemon is running; stop it before signing out. ${error.message}`);
             return ExitCode.AlreadyRunning;
         }
-        throw error;
+        throw new ConfigError(
+            `Cannot hold the daemon lock: ${error instanceof Error ? error.message : String(error)}. Check that the data dir and the vault mount are writable.`,
+        );
     }
 }
 
@@ -1202,6 +1428,11 @@ async function hashVaultFiles(vaultPath: string): Promise<Map<string, { hash: st
                 continue;
             }
             const full = path.join(dir, entry.name);
+            // Symlinks are never synced (see the adapter): hashing a link's
+            // target would verify bytes that are not the vault's.
+            if (entry.isSymbolicLink()) {
+                continue;
+            }
             if (entry.isDirectory()) {
                 await walk(full, vaultRelative);
             } else if (entry.isFile()) {
@@ -1212,6 +1443,24 @@ async function hashVaultFiles(vaultPath: string): Promise<Map<string, { hash: st
     };
     await walk(vaultPath, '');
     return found;
+}
+
+/**
+ * Whether any copy of the sync state exists on disk: the file, the temp
+ * file (a write that finished but was not yet moved into place), or the
+ * backup. Used to tell "no state yet" apart from "a state that loaded
+ * nothing for this account and folder".
+ */
+async function anyStateCopyExists(stateFile: string): Promise<boolean> {
+    for (const candidate of [stateFile, `${stateFile}.tmp`, `${stateFile}.bak`]) {
+        try {
+            await stat(candidate);
+            return true;
+        } catch {
+            continue;
+        }
+    }
+    return false;
 }
 
 async function defaultListRemote(client: ProtonDriveClient, rootUid: string, logger: Logger): Promise<Map<string, { hash?: string; size?: number }>> {
@@ -1254,15 +1503,44 @@ export async function runVerify(options: {
     }
 
     // Read-only load: entries are inspected, nothing is mutated, and close()
-    // lands before any flush could be scheduled.
-    const loadState = deps.loadState ?? (async (loadOptions: { dataDir: string; stateFile: string; logger: Logger }): Promise<StateLike> => {
+    // lands before any flush could be scheduled. The default loader restores
+    // the session first and loads with the account it finds, exactly like the
+    // boot path: loading with `null` would silently ignore a state tagged to
+    // an account and report "nothing to check" for an established vault.
+    let loadedState: StateLike;
+    let signedIn: boolean | null = null;
+    let verifyAuth: AuthLike | null = null;
+    if (deps.loadState !== undefined) {
+        loadedState = await deps.loadState({ dataDir: options.config.dataDir, stateFile: options.paths.stateFile, logger });
+    } else {
+        const key = await loadKeyMaterial(env);
+        const clientUid = await readClientUid(options.config.dataDir);
+        const createAuth = deps.createAuth ?? createProtonAuth;
+        const auth: AuthLike = await createAuth({
+            dataDir: options.config.dataDir,
+            key,
+            clientUid,
+            logger,
+            remoteFolderUid: options.config.remoteFolderUid,
+            metadataCache: options.config.metadataCache,
+        });
+        let restored = false;
+        try {
+            restored = await auth.restore();
+        } catch {
+            restored = false;
+        }
+        signedIn = restored;
+        const email = restored ? (auth.session.accountEmail ?? null) : null;
+        if (restored) {
+            verifyAuth = auth;
+        }
         const adapter = new DataDirAdapter();
-        const real = new SyncState(adapter as unknown as DataAdapter, loadOptions.stateFile, loadOptions.logger, () => undefined);
-        await real.load(null, options.config.remoteFolderUid);
-        return real;
-    });
+        const real = new SyncState(adapter as unknown as DataAdapter, options.paths.stateFile, logger, () => undefined);
+        await real.load(email, options.config.remoteFolderUid);
+        loadedState = real;
+    }
     let records: Map<string, { hash?: string; size?: number; type: 'file' | 'folder' }>;
-    const loadedState = await loadState({ dataDir: options.config.dataDir, stateFile: options.paths.stateFile, logger });
     try {
         if (loadedState.wasLost()) {
             jsonLog(io, 'error', 'verify', 'The sync state could not be read from any copy.');
@@ -1274,26 +1552,61 @@ export async function runVerify(options: {
     }
 
     if (records.size === 0) {
+        if (signedIn === false) {
+            // The records are empty because no account could be determined,
+            // not because there is nothing to check: reporting clean here
+            // would bless an unverified vault.
+            jsonLog(io, 'error', 'verify', 'Not signed in, so the account this state belongs to is unknown; cannot verify. Sign in first.');
+            return ExitCode.SignedOut;
+        }
+        if (await anyStateCopyExists(options.paths.stateFile)) {
+            // A state file exists but loaded nothing for this account and
+            // folder: it belongs to someone else, and clean would be a lie.
+            jsonLog(io, 'error', 'verify', 'A sync state file exists but records nothing for this account and folder; it belongs to a different account or folder.');
+            return ExitCode.ItemFailures;
+        }
         jsonLog(io, 'info', 'verify', 'No sync state yet; nothing to verify against. Run `once` first.');
         return ExitCode.Ok;
     }
 
-    const local = await hashVaultFiles(options.config.vaultPath);
+    let local: Map<string, { hash: string; size: number }>;
+    try {
+        local = await hashVaultFiles(options.config.vaultPath);
+    } catch (error) {
+        jsonLog(io, 'error', 'verify', `Cannot read the vault for verification: ${error instanceof Error ? error.message : String(error)}`);
+        return ExitCode.ItemFailures;
+    }
     let remote: Map<string, { hash?: string; size?: number }> | undefined;
     if (options.config.remoteFolderUid !== null) {
-        try {
-            const key = await loadKeyMaterial(env);
-            const clientUid = await readClientUid(options.config.dataDir);
-            const createAuth = deps.createAuth ?? createProtonAuth;
-            const auth = await createAuth({ dataDir: options.config.dataDir, key, clientUid, logger, remoteFolderUid: options.config.remoteFolderUid });
-            if (await auth.restore()) {
+        if (verifyAuth !== null) {
+            try {
                 const listRemote = deps.listRemote ?? defaultListRemote;
-                remote = await listRemote(auth.session.getClient(), options.config.remoteFolderUid, logger);
-            } else {
-                jsonLog(io, 'warn', 'verify', 'Not signed in; verifying the local side against the state only.');
+                remote = await listRemote(verifyAuth.session.getClient(), options.config.remoteFolderUid, logger);
+            } catch (error) {
+                jsonLog(io, 'warn', 'verify', `Remote check skipped: ${error instanceof Error ? error.message : String(error)}`);
             }
-        } catch (error) {
-            jsonLog(io, 'warn', 'verify', `Remote check skipped: ${error instanceof Error ? error.message : String(error)}`);
+        } else {
+            try {
+                const key = await loadKeyMaterial(env);
+                const clientUid = await readClientUid(options.config.dataDir);
+                const createAuth = deps.createAuth ?? createProtonAuth;
+                const auth = await createAuth({
+                    dataDir: options.config.dataDir,
+                    key,
+                    clientUid,
+                    logger,
+                    remoteFolderUid: options.config.remoteFolderUid,
+                    metadataCache: options.config.metadataCache,
+                });
+                if (await auth.restore()) {
+                    const listRemote = deps.listRemote ?? defaultListRemote;
+                    remote = await listRemote(auth.session.getClient(), options.config.remoteFolderUid, logger);
+                } else {
+                    jsonLog(io, 'warn', 'verify', 'Not signed in; verifying the local side against the state only.');
+                }
+            } catch (error) {
+                jsonLog(io, 'warn', 'verify', `Remote check skipped: ${error instanceof Error ? error.message : String(error)}`);
+            }
         }
     }
 

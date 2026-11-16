@@ -155,11 +155,21 @@ test('loadKeyMaterial takes 32 bytes from PSS_KEY_FILE only', async () => {
     const dir = mkdtempSync(path.join(tmpdir(), 'pss-key-'));
     try {
         const keyFile = path.join(dir, 'key');
-        writeFileSync(keyFile, randomBytes(32));
+        // Pin the last byte: loadKeyMaterial tolerates one trailing newline,
+        // so a random key ending in 0x0a/0x0d would read back a byte short.
+        const pinned = randomBytes(32);
+        if (pinned[31] === 0x0a || pinned[31] === 0x0d) {
+            pinned[31] = 0x20;
+        }
+        writeFileSync(keyFile, pinned);
         const key = await loadKeyMaterial({ PSS_KEY_FILE: keyFile });
         assert.equal(key.length, 32);
         // One trailing newline is tolerated (echo without -n).
-        writeFileSync(keyFile, Buffer.concat([randomBytes(32), Buffer.from('\n')]));
+        const withNewline = randomBytes(32);
+        if (withNewline[31] === 0x0a || withNewline[31] === 0x0d) {
+            withNewline[31] = 0x20;
+        }
+        writeFileSync(keyFile, Buffer.concat([withNewline, Buffer.from('\n')]));
         assert.equal((await loadKeyMaterial({ PSS_KEY_FILE: keyFile })).length, 32);
         writeFileSync(keyFile, randomBytes(10));
         await assert.rejects(loadKeyMaterial({ PSS_KEY_FILE: keyFile }), /10 bytes/);

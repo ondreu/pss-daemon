@@ -6,6 +6,7 @@
 import assert from 'node:assert/strict';
 import { createHash, randomBytes } from 'node:crypto';
 import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { chmod, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -16,6 +17,8 @@ import type { App } from 'obsidian';
 import { parseDaemonConfig, resolveDaemonPaths } from '../src/config';
 import { readHealthFile } from '../src/health';
 import {
+    assertVaultSyncable,
+    DataDirAdapter,
     diffRecords,
     importStateFile,
     installShutdownHandlers,
@@ -30,6 +33,8 @@ import {
     type SignalEmitter,
     type StateLike,
 } from '../src/daemon';
+import { runCommand } from '../src/commands';
+import { parseArgs } from '../src/cli';
 import type { HeadlessVault } from '../src/ports';
 import type { SyncPlan, SyncSummary } from '../../src/sync/engine';
 import type { SyncRecord } from '../../src/sync/types';
@@ -54,7 +59,13 @@ function tempEnv(): TempEnv {
     mkdirSync(vault, { recursive: true });
     const data = path.join(root, 'data');
     const keyFile = path.join(root, 'key');
-    writeFileSync(keyFile, randomBytes(32));
+    // loadKeyMaterial tolerates one trailing newline, so a random key ending
+    // in 0x0a/0x0d would read back a byte short — pin the last byte.
+    const keyBytes = randomBytes(32);
+    if (keyBytes[31] === 0x0a || keyBytes[31] === 0x0d) {
+        keyBytes[31] = 0x20;
+    }
+    writeFileSync(keyFile, keyBytes);
     return { root, vault, data, keyFile, env: { PSS_KEY_FILE: keyFile }, cleanup: () => rmSync(root, { recursive: true, force: true }) };
 }
 
@@ -793,5 +804,442 @@ test('login persists pairing into the config file', async () => {
         assert.equal(saved.pairing, 'merge');
     } finally {
         env.cleanup();
+    }
+});
+
+// ---------------------------------------------------------------------------
+// P0/P1 regression: data-loss findings
+// ---------------------------------------------------------------------------
+
+test('an unreadable vault subtree refuses the pass with zero engine work', async () => {
+    const env = tempEnv();
+    try {
+        const { io, stdout } = testIO(env.env);
+        const { config, paths } = baseConfig(env);
+        mkdirSync(path.join(env.vault, 'sub'), { recursive: true });
+        writeFileSync(path.join(env.vault, 'sub', 'secret.md'), 'secret');
+        await chmod(path.join(env.vault, 'sub'), 0o000);
+        try {
+            const engine = fakeEngineFns();
+            const deps = depsFor({ engine: engine.engine });
+            assert.equal(await runDaemon({ config, paths, mode: 'once', deps, io, env: env.env, emitter: fakeEmitter() }), ExitCode.ItemFailures);
+            assert.equal(engine.startCalls(), 0);
+            // Logged as JSON, so the quotes arrive escaped.
+            assert.match(stdout.join('\n'), /Cannot list/);
+        } finally {
+            await chmod(path.join(env.vault, 'sub'), 0o700);
+        }
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('a tracked path hidden behind a symlink refuses the pass', async () => {
+    const env = tempEnv();
+    let outside = '';
+    try {
+        const { io, stdout } = testIO(env.env);
+        const { config, paths } = baseConfig(env);
+        outside = mkdtempSync(path.join(tmpdir(), 'pss-outside-'));
+        writeFileSync(path.join(outside, 'secret.md'), 'outside');
+        await symlink(outside, path.join(env.vault, 'link'));
+        const engine = fakeEngineFns();
+        const deps = depsFor({
+            engine: engine.engine,
+            state: fakeStateFns({ paths: ['link/secret.md'] }).state,
+        });
+        assert.equal(await runDaemon({ config, paths, mode: 'once', deps, io, env: env.env, emitter: fakeEmitter() }), ExitCode.ItemFailures);
+        assert.equal(engine.startCalls(), 0);
+        assert.match(stdout.join('\n'), /symlink/);
+        assert.equal((await readHealthFile(paths.healthFile))?.state, 'error');
+    } finally {
+        env.cleanup();
+        if (outside !== '') {
+            rmSync(outside, { recursive: true, force: true });
+        }
+    }
+});
+
+test('assertVaultSyncable refuses unreadable and linked paths directly', async () => {
+    const env = tempEnv();
+    let outside = '';
+    try {
+        mkdirSync(path.join(env.vault, 'sub'));
+        writeFileSync(path.join(env.vault, 'sub', 's.md'), 's');
+        await chmod(path.join(env.vault, 'sub'), 0o000);
+        try {
+            await assert.rejects(assertVaultSyncable(env.vault, ['x.md']), /Cannot list "sub"/);
+        } finally {
+            await chmod(path.join(env.vault, 'sub'), 0o700);
+        }
+        await assertVaultSyncable(env.vault, ['sub/s.md']);
+        outside = mkdtempSync(path.join(tmpdir(), 'pss-outside-'));
+        await symlink(outside, path.join(env.vault, 'link'));
+        await assert.rejects(assertVaultSyncable(env.vault, ['link/secret.md']), /symlink/);
+        // Untracked links are the watcher/adapter's to skip, not the gate's.
+        await assertVaultSyncable(env.vault, ['sub/s.md']);
+    } finally {
+        env.cleanup();
+        if (outside !== '') {
+            rmSync(outside, { recursive: true, force: true });
+        }
+    }
+});
+
+/** A sync-state file as SyncState writes it, tagged to one account. */
+function writeTaggedState(dest: string, options: { email: string | null; remoteFolderUid: string | null; records: Record<string, SyncRecord> }): void {
+    writeFileSync(
+        dest,
+        JSON.stringify({
+            version: 1,
+            accountEmail: options.email,
+            remoteFolderUid: options.remoteFolderUid,
+            records: options.records,
+            conflicts: {},
+            eventCursors: {},
+        }),
+    );
+}
+
+function recordFor(filePath: string, hash: string, size: number): SyncRecord {
+    return { path: filePath, nodeUid: `n-${filePath}`, type: 'file', base: { hash, size, localMtime: 0, remoteRevisionUid: 'r1' } };
+}
+
+test('verify with the real default loader reads a signed-in account\u2019s tagged state', async () => {
+    const env = tempEnv();
+    try {
+        writeFileSync(path.join(env.vault, 'note.md'), 'hello');
+        const sha = createHash('sha1').update('hello').digest('hex');
+        const stateFile = path.join(env.data, 'sync-state.json');
+        mkdirSync(env.data, { recursive: true });
+        writeTaggedState(stateFile, {
+            email: 'nun@example.com',
+            remoteFolderUid: null,
+            records: { 'note.md': recordFor('note.md', sha, 5), 'missing.md': recordFor('missing.md', sha, 5) },
+        });
+        const { config, paths } = baseConfig(env, { remoteFolderUid: null });
+        const { io } = testIO(env.env);
+        const auth = fakeAuthFns({ restored: true, email: 'nun@example.com' });
+        // No loadState injected: the real default loader restores the session
+        // first and loads with the account it finds. Loading with null would
+        // ignore this tagged file and report "nothing to check", exit 0.
+        const deps: DaemonDeps = { createAuth: async () => auth.auth, lockProbe: { isAlive: () => false, readBootId: () => 'b' } };
+        assert.equal(await runVerify({ config, paths, deps, io, env: env.env }), ExitCode.ItemFailures);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('verify without a session refuses instead of reporting clean', async () => {
+    const env = tempEnv();
+    try {
+        const stateFile = path.join(env.data, 'sync-state.json');
+        mkdirSync(env.data, { recursive: true });
+        writeTaggedState(stateFile, {
+            email: 'nun@example.com',
+            remoteFolderUid: null,
+            records: { 'note.md': recordFor('note.md', 'abc', 5) },
+        });
+        const { config, paths } = baseConfig(env, { remoteFolderUid: null });
+        const { io, stdout } = testIO(env.env);
+        const auth = fakeAuthFns({ restored: false });
+        const deps: DaemonDeps = { createAuth: async () => auth.auth, lockProbe: { isAlive: () => false, readBootId: () => 'b' } };
+        assert.equal(await runVerify({ config, paths, deps, io, env: env.env }), ExitCode.SignedOut);
+        assert.ok(!stdout.join('\n').includes('nothing to check'), 'must not report clean while signed out');
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('verify with no state file still reports nothing to check', async () => {
+    const env = tempEnv();
+    try {
+        const { config, paths } = baseConfig(env, { remoteFolderUid: null });
+        const { io, stdout } = testIO(env.env);
+        const auth = fakeAuthFns({ restored: true, email: 'nun@example.com' });
+        const deps: DaemonDeps = { createAuth: async () => auth.auth, lockProbe: { isAlive: () => false, readBootId: () => 'b' } };
+        assert.equal(await runVerify({ config, paths, deps, io, env: env.env }), ExitCode.Ok);
+        assert.match(stdout.join('\n'), /nothing to verify against/);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('watch withholds heartbeats while the engine stalls', async () => {
+    const env = tempEnv();
+    try {
+        const { io, stdout } = testIO(env.env);
+        const { config, paths } = baseConfig(env);
+        const engine = fakeEngineFns({ summary: { status: 'syncing' } });
+        const emitter = fakeEmitter();
+        const promise = runDaemon({ config, paths, mode: 'watch', deps: depsFor({ engine: engine.engine }), io, env: env.env, emitter, heartbeatMs: 10, stallAfterMs: 80 });
+        const deadline = Date.now() + 5000;
+        while (engine.startCalls() === 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        assert.equal(engine.startCalls(), 1);
+        while (!stdout.join('\n').includes('stalled') && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        }
+        assert.match(stdout.join('\n'), /stalled/);
+        // Freshness expired: two reads of the health file agree, because no
+        // heartbeat was written since the engine stopped progressing.
+        const first = (await readHealthFile(paths.healthFile))?.updatedAt;
+        await new Promise((resolve) => setTimeout(resolve, 60));
+        const second = (await readHealthFile(paths.healthFile))?.updatedAt;
+        assert.equal(first, second);
+        const nudger = setInterval(() => emitter.emit('SIGTERM'), 5);
+        try {
+            assert.equal(await promise, ExitCode.Ok);
+        } finally {
+            clearInterval(nudger);
+        }
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('watch heartbeats while the engine progresses', async () => {
+    const env = tempEnv();
+    try {
+        const { io } = testIO(env.env);
+        const { config, paths } = baseConfig(env);
+        let pending = 0;
+        const advancing = fakeEngineFns();
+        const engine: EngineLike = { ...advancing.engine, getSummary: () => baseSummary({ status: 'syncing', pending: pending++ }) };
+        const emitter = fakeEmitter();
+        const promise = runDaemon({ config, paths, mode: 'watch', deps: depsFor({ engine }), io, env: env.env, emitter, heartbeatMs: 10, stallAfterMs: 60_000 });
+        const appeared = Date.now() + 5000;
+        let first: string | undefined;
+        while (first === undefined && Date.now() < appeared) {
+            await new Promise((resolve) => setTimeout(resolve, 15));
+            first = (await readHealthFile(paths.healthFile))?.updatedAt;
+        }
+        assert.ok(first !== undefined, 'watch writes an initial heartbeat');
+        const start = Date.now();
+        let second: string | undefined = first;
+        while (second === first && Date.now() - start < 3000) {
+            await new Promise((resolve) => setTimeout(resolve, 15));
+            second = (await readHealthFile(paths.healthFile))?.updatedAt;
+        }
+        assert.ok(second !== first, 'heartbeat must advance while the engine progresses');
+        const nudger = setInterval(() => emitter.emit('SIGTERM'), 5);
+        try {
+            assert.equal(await promise, ExitCode.Ok);
+        } finally {
+            clearInterval(nudger);
+        }
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('once interrupted by SIGTERM exits 2, never 0', async () => {
+    const env = tempEnv();
+    try {
+        const { io } = testIO(env.env);
+        const { config, paths } = baseConfig(env);
+        const fakes = fakeEngineFns();
+        let releaseStart!: () => void;
+        const gate = new Promise<void>((resolve) => {
+            releaseStart = resolve;
+        });
+        let starts = 0;
+        let stops = 0;
+        const engine: EngineLike = {
+            ...fakes.engine,
+            start: async (): Promise<void> => {
+                starts += 1;
+                await gate;
+            },
+            stop: async (): Promise<void> => {
+                stops += 1;
+                releaseStart();
+            },
+        };
+        const emitter = fakeEmitter();
+        const promise = runDaemon({ config, paths, mode: 'once', deps: depsFor({ engine }), io, env: env.env, emitter });
+        const deadline = Date.now() + 5000;
+        while (starts === 0 && Date.now() < deadline) {
+            await new Promise((resolve) => setTimeout(resolve, 5));
+        }
+        emitter.emit('SIGTERM');
+        assert.equal(await promise, ExitCode.ItemFailures);
+        assert.equal(stops, 1);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('boot wires the cache marker and node scope once the state exists', async () => {
+    const env = tempEnv();
+    try {
+        const { io } = testIO(env.env);
+        const { config, paths } = baseConfig(env);
+        const authBase = fakeAuthFns();
+        const markers: Array<() => string> = [];
+        const scopes: Array<() => Set<string>> = [];
+        const auth: AuthLike = {
+            ...authBase.auth,
+            setCacheMarker: (source: () => string): void => {
+                markers.push(source);
+            },
+            session: {
+                ...authBase.auth.session,
+                setNodeSource: (source: () => Set<string>): void => {
+                    scopes.push(source);
+                },
+            },
+        };
+        const entries: SyncRecord[] = [{ path: 'a.md', nodeUid: 'node-1', type: 'file', base: { hash: 'h', size: 1, localMtime: 0, remoteRevisionUid: 'r1' } }];
+        const deps = depsFor({ auth, state: fakeStateFns({ paths: ['a.md'], entries }).state });
+        assert.equal(await runDaemon({ config, paths, mode: 'once', deps, io, env: env.env, emitter: fakeEmitter() }), ExitCode.Ok);
+        assert.equal(markers.length, 1);
+        assert.equal(markers[0](), 'fp');
+        assert.equal(scopes.length, 1);
+        const scope = scopes[0]();
+        assert.ok(scope.has('node-1'), 'state nodes stay in cache scope');
+        assert.ok(scope.has('root-1'), 'the synced folder stays in cache scope');
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('metadataCache memory builds no cache file', async () => {
+    (globalThis as { __PLUGIN_VERSION__?: string }).__PLUGIN_VERSION__ = '0.0.0-test';
+    const { createProtonAuth } = await import('../src/auth');
+    const { FileCacheStore } = await import('../src/fileCacheStore');
+    const { Logger } = await import('../../src/util/logger');
+    const env = tempEnv();
+    try {
+        const logger = new Logger('error', 'test');
+        const key = (() => {
+            const bytes = randomBytes(32);
+            if (bytes[31] === 0x0a || bytes[31] === 0x0d) {
+                bytes[31] = 0x20;
+            }
+            return new Uint8Array(bytes);
+        })();
+        const memory = await createProtonAuth({ dataDir: env.data, key, clientUid: 'c', logger, metadataCache: 'memory' });
+        assert.equal(memory.cacheStore, null);
+        assert.equal(existsSync(path.join(env.data, 'drive-cache.bin')), false);
+        const file = await createProtonAuth({ dataDir: env.data, key, clientUid: 'c', logger });
+        assert.ok(file.cacheStore instanceof FileCacheStore);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('DataDirAdapter flushes the file and the directory on write and rename', async () => {
+    const env = tempEnv();
+    try {
+        const synced: string[] = [];
+        const adapter = new DataDirAdapter((dir) => synced.push(dir));
+        const file = path.join(env.data, 'sync-state.json');
+        await adapter.write(file, '{"v":1}');
+        assert.deepEqual(synced, [env.data]);
+        synced.length = 0;
+        await adapter.rename(file, path.join(env.data, 'sync-state.json2'));
+        assert.deepEqual(synced, [env.data]);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('approve-mass-delete honours a fresh --pairing flag', async () => {
+    const env = tempEnv();
+    try {
+        // Through runCommand, not runMassDecision directly: the bug was
+        // commands.ts dropping the flag before the decision ever saw it.
+        const file = path.join(env.root, 'daemon.json');
+        writeFileSync(file, JSON.stringify({ vaultPath: env.vault, dataDir: env.data, remoteFolderUid: 'root-1' }));
+        const { io } = testIO(env.env);
+        const engine = fakeEngineFns({ plan: bothSidesPlan() });
+        const deps = depsFor({ state: fakeStateFns({ paths: [] }).state, engine: engine.engine });
+        const code = await runCommand(parseArgs(['--config', file, 'approve-mass-delete', '--pairing', 'adopt-drive']), { deps, io, env: env.env });
+        assert.equal(code, ExitCode.Ok);
+        assert.equal(engine.lastSettings()?.conflictPolicy, 'prefer-remote');
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('a stale config pairing warns instead of deciding silently', async () => {
+    const env = tempEnv();
+    try {
+        const { io, stdout } = testIO(env.env);
+        const { config, paths } = baseConfig(env, { pairing: 'adopt-vault' });
+        const engine = fakeEngineFns({ plan: bothSidesPlan() });
+        const deps = depsFor({ state: fakeStateFns({ paths: [] }).state, engine: engine.engine });
+        assert.equal(await runDaemon({ config, paths, mode: 'once', deps, io, env: env.env, emitter: fakeEmitter() }), ExitCode.Ok);
+        assert.match(stdout.join('\n'), /from daemon\.json, not from a --pairing flag/);
+        assert.equal(engine.lastSettings()?.conflictPolicy, 'prefer-local');
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('.proton-sync never syncs: the engine excludes the vault-side lock', async () => {
+    const { PathFilter } = await import('../../src/sync/paths');
+    const filter = new PathFilter([], true, '.obsidian', null);
+    assert.equal(filter.isExcludedWithAncestors('.proton-sync/daemon.lock'), true);
+    assert.equal(filter.isExcludedWithAncestors('.proton-sync'), true);
+    assert.equal(filter.isExcludedWithAncestors('note.md'), false);
+});
+
+test('boot failures from bad config surface as exit 7', async () => {
+    const run = async (configJson: Record<string, unknown>, env: NodeJS.ProcessEnv): Promise<{ code: ExitCode; errors: string }> => {
+        const root = mkdtempSync(path.join(tmpdir(), 'pss-exit7-'));
+        try {
+            const vault = path.join(root, 'vault');
+            mkdirSync(vault, { recursive: true });
+            const file = path.join(root, 'daemon.json');
+            writeFileSync(file, JSON.stringify({ vaultPath: vault, dataDir: path.join(root, 'data'), ...configJson }));
+            const errors: string[] = [];
+            const code = await runCommand(parseArgs(['--config', file, 'once']), {
+                io: { stdout: () => undefined, stderr: (line) => errors.push(line), env },
+            });
+            return { code, errors: errors.join('\n') };
+        } finally {
+            rmSync(root, { recursive: true, force: true });
+        }
+    };
+    // Missing key file.
+    assert.equal((await run({}, {})).code, ExitCode.ConfigInvalid);
+    // Data dir inside the vault.
+    const vault = mkdtempSync(path.join(tmpdir(), 'pss-exit7-'));
+    try {
+        const file = path.join(vault, 'daemon.json');
+        writeFileSync(file, JSON.stringify({ vaultPath: vault, dataDir: path.join(vault, 'data') }));
+        const errors: string[] = [];
+        const code = await runCommand(parseArgs(['--config', file, 'once']), {
+            io: { stdout: () => undefined, stderr: (line) => errors.push(line), env: {} },
+        });
+        assert.equal(code, ExitCode.ConfigInvalid);
+    } finally {
+        rmSync(vault, { recursive: true, force: true });
+    }
+    // Unwritable vault lock: a file where the lock dir must be created.
+    const blocked = mkdtempSync(path.join(tmpdir(), 'pss-exit7-'));
+    try {
+        const vaultDir = path.join(blocked, 'vault');
+        mkdirSync(vaultDir, { recursive: true });
+        writeFileSync(path.join(vaultDir, '.proton-sync'), 'in the way');
+        const file = path.join(blocked, 'daemon.json');
+        writeFileSync(file, JSON.stringify({ vaultPath: vaultDir, dataDir: path.join(blocked, 'data') }));
+        const keyFile = path.join(blocked, 'key');
+        const keyBytes = randomBytes(32);
+        if (keyBytes[31] === 0x0a || keyBytes[31] === 0x0d) {
+            keyBytes[31] = 0x20;
+        }
+        writeFileSync(keyFile, keyBytes);
+        const errors: string[] = [];
+        const code = await runCommand(parseArgs(['--config', file, 'once']), {
+            io: { stdout: () => undefined, stderr: (line) => errors.push(line), env: { PSS_KEY_FILE: keyFile } },
+        });
+        assert.equal(code, ExitCode.ConfigInvalid);
+        assert.match(errors.join('\n'), /lock/i);
+    } finally {
+        rmSync(blocked, { recursive: true, force: true });
     }
 });

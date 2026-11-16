@@ -74,4 +74,10 @@ export type CreateProtonAuth = (options: {
     fetchImpl?: typeof fetch;
     /** The folder the engine will sync; needed to scope the metadata cache. */
     remoteFolderUid?: string | null;
+    /**
+     * `file` (default) keeps the encrypted Drive node cache between starts;
+     * `memory` trades a slower start for nothing on disk. Mirrors
+     * `DaemonConfig['metadataCache']`.
+     */
+    metadataCache?: 'file' | 'memory';
 }) => Promise<ProtonAuth>;

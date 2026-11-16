@@ -3,7 +3,7 @@
  * injectable IO/deps, loads the config, and returns an exit code — never
  * throws past the point where a code exists for the failure.
  */
-import { DEFAULT_DATA_DIR, loadDaemonConfig, resolveConfigPath } from './config';
+import { ConfigError, DEFAULT_DATA_DIR, loadDaemonConfig, resolveConfigPath } from './config';
 import { isHealthFresh, readHealthFile } from './health';
 import { runDaemon, runLogin, runMassDecision, runSignOut, runVerify, defaultIO, type DaemonDeps, type DaemonIO } from './daemon';
 import type { ParsedArgs } from './cli';
@@ -118,14 +118,19 @@ export async function runCommand(parsed: ParsedArgs, options: CommandDeps = {}):
             case 'verify':
                 return await runVerify({ ...base, json: parsed.json });
             case 'approve-mass-delete':
-                return await runMassDecision({ ...base, approve: true });
+                return await runMassDecision({ ...base, approve: true, pairing: parsed.pairing ?? null });
             case 'deny-mass-delete':
-                return await runMassDecision({ ...base, approve: false });
+                return await runMassDecision({ ...base, approve: false, pairing: parsed.pairing ?? null });
             case 'sign-out':
                 return await runSignOut(base);
         }
     } catch (error) {
-        // Everything with its own code already returned; this is unexpected.
+        // Everything with its own code already returned; this is unexpected —
+        // except configuration failures, which carry exit 7 for the runbook.
+        if (error instanceof ConfigError) {
+            io.stderr(`pss-daemon: ${error instanceof Error ? error.message : String(error)}`);
+            return ExitCode.ConfigInvalid;
+        }
         io.stderr(`pss-daemon: internal error: ${error instanceof Error ? error.message : String(error)}`);
         return ExitCode.Usage;
     }
