@@ -1,36 +1,44 @@
 /**
- * Entry point placeholder for the headless daemon.
+ * Entry point for the headless daemon.
  *
- * The scaffold exists so the build, the bundling rules and the test runner can
- * be proven before the real modules land: the interesting work (adapter, auth,
- * lifecycle, CLI) is implemented in `headless/src` by the streams that own
- * those files. Until then this command only reports what it was built with,
- * which is also the cheapest smoke test of the shared-`src` import.
+ * Thin by design: parse, dispatch, exit with the command's code. The
+ * engine's settings module stays reachable through `--probe`, the cheapest
+ * smoke test that the shared `src` is bundled.
  */
 import { DEFAULT_SETTINGS } from '../../src/settings';
+import { parseArgs, USAGE } from './cli';
+import { runCommand } from './commands';
 
-const USAGE = `pss-daemon — headless Proton Drive sync for an Obsidian vault
-
-Not implemented yet. Build scaffold only.
-
-Commands planned: login, status, once, watch, verify,
-approve-mass-delete, deny-mass-delete, sign-out.
-`;
-
-function main(argv: string[]): number {
-    if (argv.includes('--version') || argv.includes('-v')) {
+async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
+    const parsed = parseArgs(argv);
+    if (parsed.version === true) {
         process.stdout.write(`${require('../package.json').version}\n`);
         return 0;
     }
-    if (argv.includes('--probe')) {
-        // Proves the engine's settings module is bundled and reachable.
-        process.stdout.write(
-            JSON.stringify({ massDeleteThreshold: DEFAULT_SETTINGS.massDeleteThreshold }) + '\n',
-        );
+    if (parsed.probe === true) {
+        process.stdout.write(JSON.stringify({ massDeleteThreshold: DEFAULT_SETTINGS.massDeleteThreshold }) + '\n');
         return 0;
     }
-    process.stdout.write(USAGE);
-    return 0;
+    if (parsed.help === true || parsed.command === undefined) {
+        const code = parsed.error !== undefined ? 1 : 0;
+        (code === 0 ? process.stdout : process.stderr).write(USAGE);
+        if (parsed.error !== undefined) {
+            process.stderr.write(`pss-daemon: ${parsed.error}\n`);
+        }
+        return code;
+    }
+    if (parsed.error !== undefined) {
+        process.stderr.write(USAGE);
+        process.stderr.write(`pss-daemon: ${parsed.error}\n`);
+        return 1;
+    }
+    return runCommand(parsed, { env });
 }
 
-process.exit(main(process.argv.slice(2)));
+main(process.argv.slice(2), process.env).then(
+    (code) => process.exit(code),
+    (error: unknown) => {
+        process.stderr.write(`pss-daemon: fatal: ${error instanceof Error ? error.message : String(error)}\n`);
+        process.exit(1);
+    },
+);
