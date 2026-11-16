@@ -1,0 +1,29 @@
+{
+    "name": "pss-daemon",
+    "version": "0.1.0",
+    "private": true,
+    "description": "Headless Proton Drive sync daemon for an Obsidian vault, built on the proton-sdk-sync engine.",
+    "license": "GPL-3.0-or-later",
+    "author": "ondreu",
+    "homepage": "https://github.com/ondreu/proton-sdk-sync",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/ondreu/proton-sdk-sync.git"
+    },
+    "scripts": {
+        "build": "node esbuild.config.mjs production",
+        "dev": "node esbuild.config.mjs",
+        "check-types": "tsc --noEmit",
+        "test": "node scripts/test.mjs"
+    },
+    "dependencies": {
+        "@protontech/crypto": "^2.2.0",
+        "@protontech/drive-sdk": "^0.23.0",
+        "core-js": "^3.51.0"
+    },
+    "devDependencies": {
+        "@types/node": "^22.20.4",
+        "esbuild": "^0.28.2",
+        "typescript": "~6.0.3"
+    }
+}
