@@ -26,14 +26,14 @@
  * synchronous stat is also what `VaultIO`'s echo accounting reads when it
  * judges whether an event is its own write.
  */
-import { statSync } from 'node:fs';
+import { lstatSync } from 'node:fs';
 import { promises as fs } from 'node:fs';
 
 import { TFile, TFolder, type App, type TAbstractFile } from 'obsidian';
 
-import { NodeVaultAdapter } from './nodeAdapter';
+import { NodeVaultAdapter, SymlinkRefusedError } from './nodeAdapter';
 import type { CreateHeadlessVault, HeadlessVault } from './ports';
-import { startWatcher } from './watcher';
+import { startWatcher, watcherExcludedDirs } from './watcher';
 
 /** Whether Obsidian would index this path: no dot-segments. */
 function isIndexedPath(path: string): boolean {
@@ -41,7 +41,13 @@ function isIndexedPath(path: string): boolean {
 }
 
 function fileOf(adapter: NodeVaultAdapter, path: string): TFile {
-    const st = statSync(adapter.getFullPath(path));
+    // lstat: a symlink is never presented as an indexed file. The adapter
+    // refuses links outright, so a link here fails the pass closed instead
+    // of uploading the link target's bytes.
+    const st = lstatSync(adapter.getFullPath(path));
+    if (st.isSymbolicLink()) {
+        throw new SymlinkRefusedError(path);
+    }
     return Object.assign(new TFile(), {
         path,
         stat: {
@@ -72,8 +78,13 @@ export const createHeadlessVault: CreateHeadlessVault = async (options): Promise
         }
         let st;
         try {
-            st = statSync(adapter.getFullPath(path));
+            st = lstatSync(adapter.getFullPath(path));
         } catch {
+            return null;
+        }
+        // A symlink is not an indexed file: the adapter refuses links, and
+        // presenting one as a TFile would let the engine read its target.
+        if (st.isSymbolicLink()) {
             return null;
         }
         if (st.isFile()) {
@@ -141,6 +152,9 @@ export const createHeadlessVault: CreateHeadlessVault = async (options): Promise
         events,
         logger,
         rescanSeconds,
+        // The engine excludes these too (PathFilter over ALWAYS_EXCLUDED
+        // plus the config dir); the watcher must not even walk them.
+        excludedDirs: watcherExcludedDirs(configDir),
     });
 
     return {

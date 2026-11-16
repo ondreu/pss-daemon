@@ -287,3 +287,86 @@ test('close flushes the debounced changes; write debris is never reported', asyn
         rmSync(root, { recursive: true, force: true });
     }
 });
+
+test('excluded trees are never walked or watched', async () => {
+    const root = tempRoot();
+    const events = capture();
+    const logs = logCapture();
+    const manual = manualFactory();
+    try {
+        await fs.mkdir(path.join(root, '.git'));
+        await fs.writeFile(path.join(root, '.git', 'HEAD'), 'ref');
+        await fs.mkdir(path.join(root, '.trash'));
+        await fs.writeFile(path.join(root, '.trash', 'x.md'), 'trash');
+        await fs.mkdir(path.join(root, '.obsidian'));
+        await fs.writeFile(path.join(root, '.obsidian', 'app.json'), '{}');
+        await fs.mkdir(path.join(root, '.proton-sync'));
+        await fs.writeFile(path.join(root, '.proton-sync', 'daemon.lock'), '{}');
+        const handle = await startWatcher({
+            root,
+            events,
+            logger: logs.logger,
+            debounceMs: 30,
+            renamePairMs: 30,
+            rescanSeconds: 0,
+            createWatcher: manual.factory,
+        });
+        try {
+            for (const watched of manual.listeners.keys()) {
+                const rel = path.relative(root, watched);
+                assert.ok(!['.git', '.trash', '.obsidian', '.proton-sync'].includes(rel), `excluded dir is watched: ${rel}`);
+            }
+            await handle.rescan();
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            assert.equal(events.changes.length, 0, `excluded churn reported: ${events.changes}`);
+            // A normal file still reports.
+            await fs.writeFile(path.join(root, 'note.md'), 'n');
+            await handle.rescan();
+            assert.ok(events.changes.includes('note.md'), `normal file missed: ${events.changes}`);
+        } finally {
+            await handle.close();
+        }
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('a symlinked directory is skipped and logged once, never descended into', async () => {
+    const root = tempRoot();
+    const outside = tempRoot();
+    const events = capture();
+    const logs = logCapture();
+    const manual = manualFactory();
+    try {
+        await fs.writeFile(path.join(outside, 'secret.md'), 'outside');
+        const { symlink } = await import('node:fs/promises');
+        await symlink(outside, path.join(root, 'linkdir'));
+        await symlink(path.join(outside, 'secret.md'), path.join(root, 'link.md'));
+        const handle = await startWatcher({
+            root,
+            events,
+            logger: logs.logger,
+            debounceMs: 30,
+            renamePairMs: 30,
+            rescanSeconds: 0,
+            createWatcher: manual.factory,
+        });
+        try {
+            await handle.rescan();
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            assert.ok(!events.changes.some((p) => p.startsWith('linkdir')), `outside bytes reported: ${events.changes}`);
+            assert.ok(!events.changes.includes('link.md'), `link reported: ${events.changes}`);
+            const skips = logs.warns.filter((args) => String(args[0]).includes('linkdir') || String(args[0]).includes('link.md'));
+            assert.ok(skips.length >= 2, `expected skip warnings: ${JSON.stringify(logs.warns)}`);
+            const before = logs.warns.length;
+            await handle.rescan();
+            await new Promise((resolve) => setTimeout(resolve, 60));
+            assert.equal(logs.warns.length, before, 'symlink warnings must be logged once, not per rescan');
+        } finally {
+            await handle.close();
+        }
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+        rmSync(outside, { recursive: true, force: true });
+    }
+});

@@ -39,10 +39,11 @@
  * which every save briefly creates beside its target; reporting those would
  * wake the engine twice per write for paths it ignores anyway.
  */
-import { promises as fs, statSync, watch as fsWatch } from 'node:fs';
+import { promises as fs, lstatSync, watch as fsWatch } from 'node:fs';
 import type { FSWatcher } from 'node:fs';
 import path from 'node:path';
 
+import { ALWAYS_EXCLUDED } from '../../src/settings';
 import type { Logger } from '../../src/util/logger';
 import type { VaultEvents } from './ports';
 
@@ -69,6 +70,15 @@ export type WatcherOptions = {
     root: string;
     events: VaultEvents;
     logger: Log;
+    /**
+     * Vault-relative directories the watcher never walks or watches
+     * (`.git`, `.trash`, the config dir, the daemon's own `.proton-sync`):
+     * churn there never reaches the engine, and one inotify-exhausted
+     * directory no longer degrades the whole tree to warn-only. Defaults to
+     * {@link watcherExcludedDirs} of `'.obsidian'`; pass an explicit list
+     * when the vault's config dir differs.
+     */
+    excludedDirs?: string[];
     /**
      * How long to collect changes before reporting them, in milliseconds.
      * Mirrors the plugin's `uploadDebounceMs` semantics: a burst of saves
@@ -120,6 +130,23 @@ function isWriteDebris(basename: string): boolean {
     return basename.endsWith('.proton-sync.tmp');
 }
 
+/**
+ * Vault-relative directories the watcher prunes from every walk and watch:
+ * the engine's {@link ALWAYS_EXCLUDED} directory entries (`.git`, `.trash`),
+ * the daemon's own `.proton-sync` lock dir, and the Obsidian config dir
+ * (default `.obsidian`), whose churn the engine excludes as well.
+ */
+export function watcherExcludedDirs(configDir = '.obsidian'): string[] {
+    const dirs = new Set<string>(['.proton-sync', configDir]);
+    for (const pattern of ALWAYS_EXCLUDED) {
+        const dir = pattern.endsWith('/**') ? pattern.slice(0, -3) : pattern.endsWith('/') ? pattern.slice(0, -1) : null;
+        if (dir !== null && dir !== '' && !dir.includes('*')) {
+            dirs.add(dir);
+        }
+    }
+    return [...dirs];
+}
+
 function defaultFactory(
     dirAbs: string,
     listener: (eventType: 'rename' | 'change', filename: string | null) => void,
@@ -134,6 +161,9 @@ function defaultFactory(
 
 export async function startWatcher(options: WatcherOptions): Promise<WatcherHandle> {
     const { root, events, logger } = options;
+    const excludedDirs = options.excludedDirs ?? watcherExcludedDirs();
+    const isExcludedRel = (rel: string): boolean =>
+        rel !== '' && excludedDirs.some((dir) => rel === dir || rel.startsWith(`${dir}/`));
     const debounceMs = options.debounceMs ?? DEFAULT_DEBOUNCE_MS;
     const rescanSeconds = options.rescanSeconds ?? DEFAULT_RESCAN_SECONDS;
     const renamePairMs = options.renamePairMs ?? DEFAULT_RENAME_PAIR_MS;
@@ -146,6 +176,8 @@ export async function startWatcher(options: WatcherOptions): Promise<WatcherHand
     const dirty = new Set<string>();
     // Vanished paths waiting to see if their inode reappears as a rename.
     const pendingGone = new Map<string, PendingGone>();
+    // Symlink paths already warned about; the walk logs each link once.
+    const symlinkWarned = new Set<string>();
     let debounceTimer: ReturnType<typeof setTimeout> | null = null;
     let rescanTimer: ReturnType<typeof setTimeout> | null = null;
     let closed = false;
@@ -187,8 +219,15 @@ export async function startWatcher(options: WatcherOptions): Promise<WatcherHand
     async function statRel(rel: string): Promise<KnownFile | null> {
         let st;
         try {
-            st = await fs.stat(absOf(rel));
+            // lstat: a symlink is never followed. One reads as vanished here,
+            // which reports a delete — and the adapter refuses the link
+            // outright, so the pass fails closed instead of syncing the
+            // link's target. See the adapter's SymlinkRefusedError.
+            st = await fs.lstat(absOf(rel));
         } catch {
+            return null;
+        }
+        if (st.isSymbolicLink()) {
             return null;
         }
         return {
@@ -236,6 +275,11 @@ export async function startWatcher(options: WatcherOptions): Promise<WatcherHand
         if (closed || watchers.has(dirAbs)) {
             return;
         }
+        // Excluded trees are never watched: their churn is the engine's to
+        // ignore, and watching them only spends inotify instances on it.
+        if (relOf(dirAbs) !== '' && isExcludedRel(relOf(dirAbs))) {
+            return;
+        }
         try {
             watchers.set(dirAbs, createWatcher(dirAbs, listenFor(dirAbs), onWatcherError));
         } catch (error) {
@@ -245,6 +289,9 @@ export async function startWatcher(options: WatcherOptions): Promise<WatcherHand
 
     async function handleInDir(dirAbs: string, eventType: 'rename' | 'change', filename: string): Promise<void> {
         const rel = relOf(path.join(dirAbs, filename));
+        if (isExcludedRel(rel)) {
+            return;
+        }
         if (eventType === 'change') {
             const info = await statRel(rel);
             if (info === null) {
@@ -319,7 +366,7 @@ export async function startWatcher(options: WatcherOptions): Promise<WatcherHand
         for (const [rel, info] of known) {
             if (rel !== newRel && info.key === key) {
                 try {
-                    statSync(absOf(rel));
+                    lstatSync(absOf(rel));
                     return null;
                 } catch {
                     return rel;
@@ -458,10 +505,35 @@ export async function startWatcher(options: WatcherOptions): Promise<WatcherHand
             for (const entry of entries) {
                 const abs = path.join(current, entry.name);
                 const rel = relOf(abs);
+                // Excluded trees are pruned, not walked: their churn never
+                // reaches the engine, so indexing them only costs scans.
+                if (isExcludedRel(rel)) {
+                    continue;
+                }
+                // A symlinked entry is never followed — not descended into,
+                // not indexed. Outside bytes must not enter the sync as vault
+                // paths; the adapter refuses links outright if the engine
+                // ever asks after one directly.
+                if (entry.isSymbolicLink()) {
+                    if (!symlinkWarned.has(rel)) {
+                        symlinkWarned.add(rel);
+                        logger.warn(`Skipping symlink at "${rel}"; symlinks are never synced`);
+                    }
+                    continue;
+                }
                 let st;
                 try {
-                    st = await fs.stat(abs);
+                    // lstat, so a link swapped in between readdir and stat
+                    // still reads as a link rather than its target.
+                    st = await fs.lstat(abs);
                 } catch {
+                    continue;
+                }
+                if (st.isSymbolicLink()) {
+                    if (!symlinkWarned.has(rel)) {
+                        symlinkWarned.add(rel);
+                        logger.warn(`Skipping symlink at "${rel}"; symlinks are never synced`);
+                    }
                     continue;
                 }
                 const info: KnownFile = {
@@ -471,8 +543,8 @@ export async function startWatcher(options: WatcherOptions): Promise<WatcherHand
                     size: st.size,
                 };
                 found.set(rel, info);
-                // Followed symlinks could loop back onto an ancestor; one
-                // visit per identity is enough.
+                // Only real directories are descended into; symlinks never
+                // reach here, so no link can loop the walk onto an ancestor.
                 if (info.isDir && !seenDirs.has(info.key)) {
                     seenDirs.add(info.key);
                     queue.push(abs);
