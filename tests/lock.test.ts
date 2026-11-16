@@ -3,7 +3,7 @@
  * Liveness and boot id are injected so no real pid is ever signalled.
  */
 import assert from 'node:assert/strict';
-import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -43,11 +43,17 @@ test('acquire, contend and release', async () => {
     }
 });
 
-test('a dead owner is taken over loudly, never silently', async () => {
+test('a dead owner with a stale heartbeat is taken over loudly, never silently', async () => {
     const root = dir();
     try {
         const lockPath = path.join(root, 'daemon.lock');
-        writeFileSync(lockPath, JSON.stringify({ pid: 999001, bootId: 'boot-test', startedAt: 'old', vaultPath: '/vault' }));
+        // Dead pid *and* a heartbeat weeks old: abandoned, not foreign.
+        writeFileSync(
+            lockPath,
+            JSON.stringify({ pid: 999001, bootId: 'boot-test', startedAt: 'old', vaultPath: '/vault', heartbeatAt: new Date(Date.now() - 600_000).toISOString() }),
+        );
+        const old = new Date(Date.now() - 600_000);
+        utimesSync(lockPath, old, old);
         const reasons: string[] = [];
         const lock = await DaemonLock.acquire(
             lockPath,
@@ -59,6 +65,61 @@ test('a dead owner is taken over loudly, never silently', async () => {
         assert.match(reasons[0], /999001/);
         assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { pid: number }).pid, 222);
         await lock.release();
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('a dead-looking pid with a fresh heartbeat is refused, not taken over', async () => {
+    const root = dir();
+    try {
+        const lockPath = path.join(root, 'daemon.lock');
+        // Same boot, heartbeat seconds old, but this namespace cannot see the
+        // pid (the foreign-container case): taking over would mean two writers.
+        writeFileSync(
+            lockPath,
+            JSON.stringify({ pid: 999001, bootId: 'boot-test', startedAt: 'old', vaultPath: '/vault', heartbeatAt: new Date().toISOString() }),
+        );
+        await assert.rejects(
+            DaemonLock.acquire(
+                lockPath,
+                { pid: 222, bootId: 'boot-test', startedAt: new Date().toISOString(), vaultPath: '/vault' },
+                probe({ isAlive: () => false }),
+            ),
+            LockHeldError,
+        );
+        // The holder's file is untouched.
+        assert.equal((JSON.parse(readFileSync(lockPath, 'utf8')) as { pid: number }).pid, 999001);
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('two live lock objects in one process: the second is refused', async () => {
+    const root = dir();
+    try {
+        const lockPath = path.join(root, 'daemon.lock');
+        const first = await DaemonLock.acquire(
+            lockPath,
+            { pid: process.pid, bootId: 'boot-test', startedAt: new Date().toISOString(), vaultPath: '/vault' },
+            probe({ isAlive: (pid) => pid === process.pid }),
+            undefined,
+            { heartbeatMs: 50 },
+        );
+        try {
+            // A second acquirer in another pid namespace sees a dead pid but
+            // the same boot id and a fresh heartbeat: fail closed.
+            await assert.rejects(
+                DaemonLock.acquire(
+                    lockPath,
+                    { pid: 4242, bootId: 'boot-test', startedAt: new Date().toISOString(), vaultPath: '/vault' },
+                    probe({ isAlive: () => false }),
+                ),
+                LockHeldError,
+            );
+        } finally {
+            await first.release();
+        }
     } finally {
         rmSync(root, { recursive: true, force: true });
     }
@@ -145,4 +206,31 @@ test('thisLockInfo carries pid, boot id and vault', () => {
     assert.equal(info.bootId, 'boot-9');
     assert.equal(info.vaultPath, '/vault');
     assert.ok(Date.parse(info.startedAt) > 0);
+});
+
+test('the heartbeat rewrites the payload without corrupting it', async () => {
+    const root = dir();
+    try {
+        const lockPath = path.join(root, 'daemon.lock');
+        const lock = await DaemonLock.acquire(
+            lockPath,
+            { pid: 4242, bootId: 'boot-test', startedAt: new Date().toISOString(), vaultPath: '/vault' },
+            probe(),
+            undefined,
+            { heartbeatMs: 20 },
+        );
+        try {
+            await new Promise((resolve) => setTimeout(resolve, 100));
+            // Still one JSON object, not several glued together: a torn
+            // payload reads as "unreadable, take over", which would steal a
+            // live lock.
+            const stored = JSON.parse(readFileSync(lockPath, 'utf8')) as { pid: number; heartbeatAt: string };
+            assert.equal(stored.pid, 4242);
+            assert.ok(Date.now() - Date.parse(stored.heartbeatAt) < 5_000, 'heartbeat is fresh');
+        } finally {
+            await lock.release();
+        }
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
 });
