@@ -40,10 +40,22 @@ async function main(argv: string[], env: NodeJS.ProcessEnv): Promise<number> {
     return runCommand(parsed, { env });
 }
 
+/**
+ * Exit only once stdout has drained.
+ *
+ * `process.exit()` drops whatever is still buffered in a pipe, and `verify
+ * --json` on a real vault is far larger than one pipe buffer: the report was
+ * cut at 64 KiB and could not be parsed. Awaiting the flush costs one turn and
+ * makes machine-readable output whole.
+ */
+function exitAfterFlush(code: number): void {
+    process.stdout.write('', () => process.exit(code));
+}
+
 main(process.argv.slice(2), process.env).then(
-    (code) => process.exit(code),
+    (code) => exitAfterFlush(code),
     (error: unknown) => {
         process.stderr.write(`pss-daemon: fatal: ${error instanceof Error ? error.message : String(error)}\n`);
-        process.exit(1);
+        process.stderr.write('', () => process.exit(1));
     },
 );

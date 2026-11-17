@@ -23,6 +23,7 @@ import type { DataAdapter } from 'obsidian';
 import { DEFAULT_SETTINGS, type PluginSettings } from '../../src/settings';
 import { DeviceRegistry } from '../../src/sync/devices';
 import { DriveIO, sharedWithOthers } from '../../src/sync/drive';
+import { PathFilter } from '../../src/sync/paths';
 import { SyncEngine, type EngineHooks, type SyncPlan, type SyncSummary } from '../../src/sync/engine';
 import { DESKTOP } from '../../src/sync/engine/types';
 import { SyncState } from '../../src/sync/state';
@@ -1644,7 +1645,16 @@ export function diffRecords(
     return report;
 }
 
-async function hashVaultFiles(vaultPath: string): Promise<Map<string, { hash: string; size: number }>> {
+export async function hashVaultFiles(
+    vaultPath: string,
+    /**
+     * What the engine itself never syncs. Without it, `verify` reports the
+     * vault's own `.git`, plugin code and workspace files as "untracked" and a
+     * perfectly synced vault never verifies clean — which is exactly the gate
+     * the cutover depends on.
+     */
+    isExcluded: (vaultPath: string) => boolean,
+): Promise<Map<string, { hash: string; size: number }>> {
     const found = new Map<string, { hash: string; size: number }>();
     const walk = async (dir: string, prefix: string): Promise<void> => {
         const entries = await readdir(dir, { withFileTypes: true });
@@ -1652,6 +1662,9 @@ async function hashVaultFiles(vaultPath: string): Promise<Map<string, { hash: st
             const vaultRelative = prefix === '' ? entry.name : `${prefix}/${entry.name}`;
             // The daemon's own lock lives in the vault but never syncs.
             if (vaultRelative === '.proton-sync' || vaultRelative.startsWith('.proton-sync/')) {
+                continue;
+            }
+            if (isExcluded(vaultRelative)) {
                 continue;
             }
             const full = path.join(dir, entry.name);
@@ -1812,7 +1825,25 @@ export async function runVerify(options: {
 
     let local: Map<string, { hash: string; size: number }>;
     try {
-        local = await hashVaultFiles(options.config.vaultPath);
+        // Same exclusions the engine syncs with: a vault that is perfectly in
+        // sync still has .git and plugin code on disk, and those must not read
+        // as divergence.
+        const settings = toPluginSettings(options.config, { autoSync: false });
+        // The state records what the engine decided when it synced: a private
+        // folder keeps plugin code, a shared one never does. Deriving the flag
+        // from the records keeps verify's exclusions identical to the pass that
+        // wrote them, instead of guessing and reporting false divergence.
+        const pluginPrefix = `${options.config.configDir}/plugins/`;
+        const folderShared = ![...records.keys()].some((recordPath) => recordPath.startsWith(pluginPrefix));
+        const filter = new PathFilter(
+            settings.excludePatterns,
+            settings.syncObsidianConfig,
+            options.config.configDir,
+            null,
+            folderShared,
+            false,
+        );
+        local = await hashVaultFiles(options.config.vaultPath, (vaultPath) => filter.isExcluded(vaultPath));
     } catch (error) {
         jsonLog(io, 'error', 'verify', `Cannot read the vault for verification: ${error instanceof Error ? error.message : String(error)}`);
         return ExitCode.ItemFailures;
