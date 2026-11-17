@@ -38,7 +38,7 @@ test('defaults match the arch doc', () => {
     assert.equal(config.transferConcurrency, 3);
     assert.equal(config.pairing, null);
     assert.equal(config.logLevel, 'info');
-    assert.equal(config.metadataCache, 'file');
+    assert.equal(config.metadataCache, 'memory');
 });
 
 test('massDeleteThreshold default follows DEFAULT_SETTINGS', () => {

@@ -144,7 +144,12 @@ export function parseDaemonConfig(raw: unknown): { config: DaemonConfig; warning
     }
 
     const cacheRaw = raw['metadataCache'];
-    const metadataCache = cacheRaw === undefined ? 'file' : cacheRaw;
+    // Memory by default: a persisted node cache is only as fresh as the last
+// event feed the process consumed, and `once` compares the tree without
+    // draining events first — a stale cache there silently overwrites a remote
+    // edit. The cost is a full metadata fetch per start, which is the right
+    // trade for a vault that must not lose notes.
+    const metadataCache = cacheRaw === undefined ? 'memory' : cacheRaw;
     if (metadataCache !== 'file' && metadataCache !== 'memory') {
         fail('"metadataCache" must be "file" or "memory".');
     }
