@@ -97,7 +97,7 @@ export function parseDaemonConfig(raw: unknown): { config: DaemonConfig; warning
     const remoteFolderUid = typeof remoteRaw === 'string' ? remoteRaw : null;
 
     const policyRaw = raw['conflictPolicy'];
-    const conflictPolicy = policyRaw === undefined ? 'keep-both' : policyRaw;
+    const conflictPolicy = policyRaw === undefined ? 'merge' : policyRaw;
     if (conflictPolicy === 'manual') {
         fail('Conflict policy "manual" waits for a user who will never come; use "keep-both", "merge", "prefer-local" or "prefer-remote".');
     }

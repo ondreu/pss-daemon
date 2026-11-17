@@ -32,7 +32,7 @@ test('defaults match the arch doc', () => {
     assert.equal(config.configDir, '.obsidian');
     assert.equal(config.dataDir, DEFAULT_DATA_DIR);
     assert.equal(config.remoteFolderUid, null);
-    assert.equal(config.conflictPolicy, 'keep-both');
+    assert.equal(config.conflictPolicy, 'merge');
     assert.equal(config.massDeleteThreshold, DEFAULT_SETTINGS.massDeleteThreshold);
     assert.equal(config.remotePollSeconds, 60);
     assert.equal(config.transferConcurrency, 3);

@@ -20,7 +20,7 @@ import path from 'node:path';
 import type { ProtonDriveClient } from '@protontech/drive-sdk';
 import type { DataAdapter } from 'obsidian';
 
-import { DEFAULT_SETTINGS, type PluginSettings } from '../../src/settings';
+import { DEFAULT_SETTINGS, DEVICES_FOLDER, type PluginSettings } from '../../src/settings';
 import { DeviceRegistry } from '../../src/sync/devices';
 import { DriveIO, sharedWithOthers } from '../../src/sync/drive';
 import { PathFilter } from '../../src/sync/paths';
@@ -1174,6 +1174,26 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
                     return;
                 }
                 const current = boot.engine.getSummary();
+                // Idle with nothing queued is healthy, not stalled: the summary
+                // stops changing the moment the engine has nothing to do, so a
+                // fingerprint-only heartbeat made every quiet vault look wedged
+                // within two polls and the container healthcheck fail. A pass
+                // that is genuinely stuck keeps status 'syncing', which the
+                // fingerprint below still catches.
+                const quietAndIdle = current.status === 'idle' && current.pending === 0 && current.pendingMassDelete === undefined;
+                if (quietAndIdle) {
+                    lastProgressAt = Date.now();
+                    stallNoted = false;
+                    lastFingerprint = summaryFingerprint(current);
+                    await boot.writeHealth({
+                        state: mapEngineStatus(current.status),
+                        lastSummary: current,
+                        pendingConflicts: current.conflicts,
+                        massDeleteHeld: [],
+                        error: current.lastError,
+                    }).catch(() => undefined);
+                    return;
+                }
                 if (summaryFingerprint(current) !== lastFingerprint) {
                     // Progress: the heartbeat is earned, and the stall clock restarts.
                     lastFingerprint = summaryFingerprint(current);
@@ -1707,6 +1727,12 @@ async function defaultListRemote(client: ProtonDriveClient, rootUid: string, log
     const tree = await new DriveIO(client, logger).listTree(rootUid, () => true);
     const remote = new Map<string, { hash?: string; size?: number }>();
     for (const [remotePath, remoteState] of tree.files) {
+        // The device registry is a rendezvous between clients, never part of
+        // the vault: its files have no state records by design, so counting
+        // them here made a healthy vault verify as divergent forever.
+        if (remotePath === DEVICES_FOLDER || remotePath.startsWith(`${DEVICES_FOLDER}/`)) {
+            continue;
+        }
         remote.set(remotePath, { ...(remoteState.hash !== undefined ? { hash: remoteState.hash } : {}), ...(remoteState.size !== undefined ? { size: remoteState.size } : {}) });
     }
     return remote;
