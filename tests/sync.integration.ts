@@ -268,6 +268,55 @@ describe('conflicts and races (#8, #13, #14, #15)', () => {
         });
     }
 
+    it('#14b: collide-then-folder-delete restores the edit, deletes the untouched sibling both sides (chaos seed 11)', async () => {
+        // Minimal deterministic shape of chaos seed 11 seq 323/366 (and
+        // 541/632): a collide on other.md resolved by keep-both, then a
+        // folder-delete-vs-edit that removes the folder locally while the
+        // remote rewrites note.md. The edit must be restored; the sibling
+        // neither side rewrote afterwards converges to deleted on both
+        // sides — policy, not loss.
+        const world = await createWorld();
+        try {
+            const dir = 'contested-298';
+            await writeText(world.vaultDir, `${dir}/note.md`, '# Contested\n\ntok-setup\n');
+            await writeText(world.vaultDir, `${dir}/other.md`, '# Other\n\ntok-setup\n');
+            await world.sync();
+
+            const localTok = 'tok-local';
+            const remoteTok = 'tok-remote';
+            const body = await readText(world.vaultDir, `${dir}/other.md`);
+            await writeText(world.vaultDir, `${dir}/other.md`, `${body}local ${localTok}\n${localTok}\n`);
+            const remoteBody = remoteText(world, `${dir}/other.md`) ?? '';
+            world.fault.inner.put(`${dir}/other.md`, `${remoteBody}remote ${remoteTok}\n${remoteTok}\n`);
+            await world.sync();
+
+            const keptBoth = world.conflicts.filter(
+                (event) => event.path === `${dir}/other.md` && event.outcome === 'kept-both',
+            );
+            assert.equal(keptBoth.length, 1, 'the collide kept both versions before the folder contest');
+
+            await fs.rm(full(world, dir), { recursive: true, force: true });
+            world.fault.inner.put(`${dir}/note.md`, '# Contested\n\nremote edit tok-contest\ntok-contest\n');
+            for (let i = 0; i < 6; i++) {
+                await world.sync();
+            }
+
+            assert.equal(await localText(world, `${dir}/note.md`), remoteText(world, `${dir}/note.md`), 'edited file converges');
+            assert.ok((await localText(world, `${dir}/note.md`))?.includes('tok-contest'), 'contest edit restored locally');
+            assert.equal(remoteText(world, `${dir}/note.md`)?.includes('tok-contest'), true, 'contest edit kept remotely');
+            assert.equal(await localText(world, `${dir}/other.md`), null, 'untouched sibling deleted locally');
+            assert.equal(remoteText(world, `${dir}/other.md`), null, 'untouched sibling deleted remotely');
+            const lingering = world.fault
+                .inner.filePaths()
+                .filter((rel) => rel === `${dir}/other.md` || rel.includes('(conflict '));
+            assert.deepEqual(lingering, [], 'no live file or conflict copy of the sibling remains on either side');
+            assert.equal(world.engine.pendingChanges().length, 0, 'nothing pending at quiescence');
+            assert.equal(world.state.retryEntries().length, 0, 'nothing queued at quiescence');
+        } finally {
+            await world.close();
+        }
+    });
+
     it('#15: truncation to empty keeps the prior version in history before emptying the remote', async () => {
         const world = await createWorld();
         try {

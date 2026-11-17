@@ -22,6 +22,9 @@
  *   --seed N      fixed seed for the weighted op choice (default 1)
  *   --kills N     simulated kills at peak in-flight (default: 1, 3 when minutes >= 30)
  *   --out DIR     ledger + samples destination (default: a temp dir, printed at the end)
+ *   --until-seq N stop the writers once op seq N is reached, then quiesce and
+ *                 verify: replays a ledger prefix deterministically in seconds
+ *                 instead of re-running the whole window (same seed required).
  *
  * What this is not: the SDK's own retry of 429/5xx, real crash durability
  * (fdatasync/rename), real Proton behavior and real inotify all stay out of
@@ -50,7 +53,7 @@ function mulberry32(seed: number): () => number {
     };
 }
 
-function args(): { minutes: number; seed: number; kills: number | null; out: string | null } {
+function args(): { minutes: number; seed: number; kills: number | null; out: string | null; untilSeq: number | null } {
     const raw = process.argv.slice(2);
     const get = (name: string): string | null => {
         const index = raw.indexOf(name);
@@ -59,11 +62,14 @@ function args(): { minutes: number; seed: number; kills: number | null; out: str
     const minutes = Number(get('--minutes') ?? 5);
     const seed = Number(get('--seed') ?? 1);
     const killsRaw = get('--kills');
+    const untilRaw = get('--until-seq');
+    const untilSeq = untilRaw === null ? null : Number(untilRaw);
     return {
         minutes: Number.isFinite(minutes) && minutes > 0 ? minutes : 5,
         seed: Number.isFinite(seed) ? seed : 1,
         kills: killsRaw === null ? null : Number(killsRaw),
         out: get('--out'),
+        untilSeq: untilSeq !== null && Number.isFinite(untilSeq) && untilSeq > 0 ? Math.floor(untilSeq) : null,
     };
 }
 
@@ -110,7 +116,7 @@ const TOKEN = (run: string, seq: number) => `tok-${run}-${seq}`;
 const EXCLUDED = 'chaos-excluded';
 
 async function main(): Promise<void> {
-    const { minutes, seed, kills: killsArg, out } = args();
+    const { minutes, seed, kills: killsArg, out, untilSeq } = args();
     const run = `s${seed}`;
     const random = mulberry32(seed);
     const killsRemaining = { count: killsArg ?? (minutes >= 30 ? 3 : 1) };
@@ -566,7 +572,7 @@ async function main(): Promise<void> {
     };
 
     let streakArmed = false;
-    while (Date.now() < deadline - 30_000) {
+    while (Date.now() < deadline - 30_000 && (untilSeq === null || seq < untilSeq)) {
         if (!streakArmed && Date.now() - startedAt > ((deadline - startedAt) * 2) / 3) {
             streakArmed = true;
             world.fault.failNext('iterateNodes', 25, () => serverError(500, 'Internal error (fault injection)'));
@@ -738,7 +744,40 @@ async function main(): Promise<void> {
                     localLiveOf.get(mine) === remoteLiveOf.get(mine) &&
                     !blobs.some((blob) => isConflictCopyOf(blob.rel, mine)),
             );
-        if (isExcluded(op.paths[0]) || superseded || deletedAfter || truncatedAfter || contestSealed || siblingWon) {
+        // A collide resolved by keep-both, then swept away by a later folder
+        // contest: the engine demonstrably kept both versions (a kept-both
+        // conflict event on this file), the folder contest settled correctly
+        // (its own edit token survived), and the file plus its copies are gone
+        // on BOTH sides. That is converged deletion by policy — the local
+        // folder delete propagated to a sibling the surviving side never
+        // rewrote — not a dropped edit. All three legs are required: without
+        // the kept-both event this would hide an engine that dropped a side
+        // without copying; without both-sides absence a lingering copy stays
+        // a strict loss/divergence.
+        const folderContestSealed =
+            op.op === 'collide' &&
+            ops.some(
+                (other) =>
+                    other.seq > op.seq &&
+                    other.op === 'folder-delete-vs-edit' &&
+                    other.paths.map(canon).some(onSamePath) &&
+                    other.token !== null &&
+                    foundTokens.has(other.token),
+            ) &&
+            world.conflicts.some(
+                (event) =>
+                    event.outcome === 'kept-both' &&
+                    (event.reason === 'both-modified' || event.reason === 'both-created') &&
+                    [...filedUnder].some(
+                        (mine) =>
+                            canon(event.path) === mine ||
+                            (event.copyPath !== undefined &&
+                                (canon(event.copyPath) === mine || isConflictCopyOf(canon(event.copyPath), mine))) ||
+                            isConflictCopyOf(canon(event.path), mine),
+                    ),
+            ) &&
+            !blobs.some((blob) => [...filedUnder].some((mine) => blob.rel === mine || isConflictCopyOf(blob.rel, mine)));
+        if (isExcluded(op.paths[0]) || superseded || deletedAfter || truncatedAfter || contestSealed || siblingWon || folderContestSealed) {
             tokensExcused += 1;
             continue;
         }
@@ -776,8 +815,19 @@ async function main(): Promise<void> {
 
     // Copies complete: every conflict copy's bytes must equal a recorded
     // version — a partial copy is data loss wearing a conflict's clothes.
+    // A copy the harness itself clean-truncated (a one-sided truncate op on
+    // its exact path) is an edit, not a torn copy: it empties to zero bytes
+    // that match no recorded version, exactly like the truncatedAfter token
+    // excuse above. Contested truncates never excuse.
+    const cleanTruncated = (rel: string): boolean =>
+        ops.some(
+            (other) =>
+                other.op === 'truncate' &&
+                !other.contested &&
+                other.paths.map(canon).some((truncated) => truncated === canon(rel)),
+        );
     const copies = blobs.filter((blob) => isCopy(blob.rel));
-    const incomplete = copies.filter((copy) => !versionShas.has(copy.sha));
+    const incomplete = copies.filter((copy) => !versionShas.has(copy.sha) && !cleanTruncated(copy.rel));
     if (incomplete.length > 0) {
         failures.push(`P0 incomplete copies (${incomplete.length}): ${incomplete.slice(0, 5).map((copy) => copy.rel).join(', ')}`);
     }
