@@ -42,8 +42,8 @@ describe('deployment artifacts', () => {
         assert.match(dockerfile, /USER 65532:65532/, 'drops to uid/gid 65532');
         assert.match(
             dockerfile,
-            /COPY --chmod=755 headless\/dist\/pss-daemon\.cjs \/usr\/local\/bin\/pss-daemon/,
-            'ships the prebuilt bundle from headless/dist, not a build',
+            /COPY --chmod=755 dist\/pss-daemon\.cjs \/usr\/local\/bin\/pss-daemon/,
+            'ships the prebuilt bundle from dist, not a build',
         );
         assert.match(dockerfile, /ENTRYPOINT \["pss-daemon-entrypoint"\]/, 'wraps exits that need a human');
         for (const forbidden of ['npm install', 'npm ci', 'apt-get', 'apk add']) {
@@ -68,7 +68,7 @@ describe('deployment artifacts', () => {
     });
 
     it('entrypoint wrapper holds 4/5/6 and passes everything else through', () => {
-        const entry = readRepo('headless/docker-entrypoint.sh');
+        const entry = readRepo('docker-entrypoint.sh');
         for (const code of ['4)', '5)', '6)']) {
             assert.ok(entry.includes(code), `wrapper handles exit ${code}`);
         }

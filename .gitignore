@@ -1,0 +1,6 @@
+node_modules/
+dist/
+*.bin
+session.bin
+drive-cache.bin
+.DS_Store

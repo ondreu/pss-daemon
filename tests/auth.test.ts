@@ -7,8 +7,8 @@ import { before, describe, it } from 'node:test';
 
 import { NodeType, type ProtonDriveClient } from '@protontech/drive-sdk';
 
-import type { ProtonSession } from '../../src/proton/session';
-import { Logger } from '../../src/util/logger';
+import type { ProtonSession } from '../engine/src/proton/session';
+import { Logger } from '../engine/src/util/logger';
 
 const SILENT = new Logger('error');
 const dir = () => mkdtemp(join(tmpdir(), 'pss-auth-'));

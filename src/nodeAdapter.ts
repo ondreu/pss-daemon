@@ -40,7 +40,7 @@ import path from 'node:path';
 
 import type { DataAdapter, DataWriteOptions, ListedFiles, Stat } from 'obsidian';
 
-import { staysInVault } from '../../src/sync/paths';
+import { staysInVault } from '../engine/src/sync/paths';
 
 /**
  * Thrown when a vault path resolves to a symlink. The daemon never follows

@@ -21,7 +21,7 @@ import { parseDaemonConfig, resolveDaemonPaths } from '../src/config';
 import { runDaemon, runLogin, type AuthLike, type DaemonDeps, type DaemonIO, type EngineLike, type StateLike } from '../src/daemon';
 import { FileSlot } from '../src/fileSlot';
 import type { HeadlessVault } from '../src/ports';
-import type { SyncSummary } from '../../src/sync/engine';
+import type { SyncSummary } from '../engine/src/sync/engine';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from '../src/types';
 
 const WRONG_KEY = Buffer.alloc(32, 9);

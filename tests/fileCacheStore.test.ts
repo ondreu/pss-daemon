@@ -9,8 +9,8 @@ import {
     EncryptedEntitiesCache,
     newCacheKey,
     type StoredEntry,
-} from '../../src/proton/persistentCache';
-import { Logger } from '../../src/util/logger';
+} from '../engine/src/proton/persistentCache';
+import { Logger } from '../engine/src/util/logger';
 import { FileCacheStore, MAX_CACHE_ENTRIES } from '../src/fileCacheStore';
 
 const SILENT = new Logger('error');

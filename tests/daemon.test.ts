@@ -36,8 +36,8 @@ import {
 import { runCommand } from '../src/commands';
 import { parseArgs } from '../src/cli';
 import type { HeadlessVault } from '../src/ports';
-import type { SyncPlan, SyncSummary } from '../../src/sync/engine';
-import type { SyncRecord } from '../../src/sync/types';
+import type { SyncPlan, SyncSummary } from '../engine/src/sync/engine';
+import type { SyncRecord } from '../engine/src/sync/types';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from '../src/types';
 
 // ---------------------------------------------------------------------------
@@ -1132,7 +1132,7 @@ test('metadataCache memory builds no cache file', async () => {
     (globalThis as { __PLUGIN_VERSION__?: string }).__PLUGIN_VERSION__ = '0.0.0-test';
     const { createProtonAuth } = await import('../src/auth');
     const { FileCacheStore } = await import('../src/fileCacheStore');
-    const { Logger } = await import('../../src/util/logger');
+    const { Logger } = await import('../engine/src/util/logger');
     const env = tempEnv();
     try {
         const logger = new Logger('error', 'test');
@@ -1203,7 +1203,7 @@ test('a stale config pairing warns instead of deciding silently', async () => {
 });
 
 test('.proton-sync never syncs: the engine excludes the vault-side lock', async () => {
-    const { PathFilter } = await import('../../src/sync/paths');
+    const { PathFilter } = await import('../engine/src/sync/paths');
     const filter = new PathFilter([], true, '.obsidian', null);
     assert.equal(filter.isExcludedWithAncestors('.proton-sync/daemon.lock'), true);
     assert.equal(filter.isExcludedWithAncestors('.proton-sync'), true);

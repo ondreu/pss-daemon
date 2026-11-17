@@ -18,12 +18,12 @@ import { promises as fs } from 'node:fs';
 import type { DataAdapter } from 'obsidian';
 import type { ProtonDriveClient } from '@protontech/drive-sdk';
 
-import { DEFAULT_SETTINGS, type PluginSettings } from '../../../src/settings';
-import { SyncEngine, type ConflictEvent, type SyncSummary } from '../../../src/sync/engine';
-import { DESKTOP } from '../../../src/sync/engine/types';
-import { SyncState } from '../../../src/sync/state';
-import { Logger } from '../../../src/util/logger';
-import { SYNC_ROOT } from '../../../tests/support/fakes';
+import { DEFAULT_SETTINGS, type PluginSettings } from '../../engine/src/settings';
+import { SyncEngine, type ConflictEvent, type SyncSummary } from '../../engine/src/sync/engine';
+import { DESKTOP } from '../../engine/src/sync/engine/types';
+import { SyncState } from '../../engine/src/sync/state';
+import { Logger } from '../../engine/src/util/logger';
+import { SYNC_ROOT } from '../../engine/tests/support/fakes';
 import { createHeadlessVault } from '../../src/headlessApp';
 import type { HeadlessVault, VaultEvents } from '../../src/ports';
 import { FaultDrive } from './faultDrive';

@@ -5,7 +5,7 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
 
-import { DEFAULT_SETTINGS, MIN_POLL_SECONDS } from '../../src/settings';
+import { DEFAULT_SETTINGS, MIN_POLL_SECONDS } from '../engine/src/settings';
 import { ExitCode } from '../src/types';
 
 test('the engine settings are reachable from the daemon bundle', () => {

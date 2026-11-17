@@ -16,7 +16,7 @@ import { createHash } from 'node:crypto';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { LARGE_FILE_BYTES } from '../../../src/sync/vault';
+import { LARGE_FILE_BYTES } from '../../engine/src/sync/vault';
 
 export const CASE_RENAME_FILE = 'cases/Note.md';
 export const NFC_TWIN = 'unicode/caf\u00e9.md';

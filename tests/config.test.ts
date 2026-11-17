@@ -19,7 +19,7 @@ import {
     resolveDaemonPaths,
     vaultLockFile,
 } from '../src/config';
-import { DEFAULT_SETTINGS, MIN_POLL_SECONDS } from '../../src/settings';
+import { DEFAULT_SETTINGS, MIN_POLL_SECONDS } from '../engine/src/settings';
 
 function minimal(overrides: Record<string, unknown> = {}): Record<string, unknown> {
     return { vaultPath: '/vault', ...overrides };

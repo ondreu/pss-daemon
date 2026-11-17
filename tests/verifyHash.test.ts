@@ -11,7 +11,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import { PathFilter } from '../../src/sync/paths';
+import { PathFilter } from '../engine/src/sync/paths';
 import { hashVaultFiles } from '../src/daemon';
 
 function tree(files: string[]): { root: string; cleanup: () => void } {

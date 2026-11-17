@@ -3,7 +3,7 @@ import { createCipheriv, createDecipheriv, randomBytes, scrypt as scryptNode } f
 import { promises as fs } from 'node:fs';
 import { dirname } from 'node:path';
 
-import { UnreadableSlotError, type SecretSlot } from '../../src/proton/secretStore';
+import { UnreadableSlotError, type SecretSlot } from '../engine/src/proton/secretStore';
 
 /** scrypt as a promise, typed where `promisify` is not. */
 function scryptAsync(

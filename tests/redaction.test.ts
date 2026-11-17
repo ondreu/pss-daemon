@@ -19,8 +19,8 @@ import type { App } from 'obsidian';
 import { parseDaemonConfig, resolveDaemonPaths } from '../src/config';
 import { runDaemon, runVerify, type AuthLike, type DaemonDeps, type DaemonIO, type EngineLike, type StateLike } from '../src/daemon';
 import type { HeadlessVault } from '../src/ports';
-import type { SyncPlan, SyncSummary } from '../../src/sync/engine';
-import type { SyncRecord } from '../../src/sync/types';
+import type { SyncPlan, SyncSummary } from '../engine/src/sync/engine';
+import type { SyncRecord } from '../engine/src/sync/types';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from '../src/types';
 
 const SECRET = 'TopSecret-Note-XYZ-7';

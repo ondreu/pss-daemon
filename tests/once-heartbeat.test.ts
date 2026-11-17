@@ -22,7 +22,7 @@ import { parseDaemonConfig, resolveDaemonPaths } from '../src/config';
 import { isHealthFresh, type HealthFile } from '../src/health';
 import { runDaemon, type AuthLike, type DaemonDeps, type DaemonIO, type EngineLike, type StateLike } from '../src/daemon';
 import type { HeadlessVault } from '../src/ports';
-import type { SyncPlan, SyncSummary } from '../../src/sync/engine';
+import type { SyncPlan, SyncSummary } from '../engine/src/sync/engine';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from '../src/types';
 
 type TempEnv = { root: string; vault: string; data: string; env: { PSS_KEY_FILE: string }; cleanup: () => void };

@@ -10,7 +10,7 @@ import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
 
-import type { ProtonSession } from '../../src/proton/session';
+import type { ProtonSession } from '../engine/src/proton/session';
 import { parseArgs } from '../src/cli';
 import { runResolveFolder, type DaemonIO } from '../src/daemon';
 import type { CreateProtonAuth } from '../src/ports';

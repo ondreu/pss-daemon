@@ -5,7 +5,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, type TestContext } from 'node:test';
 
-import { UnreadableSlotError } from '../../src/proton/secretStore';
+import { UnreadableSlotError } from '../engine/src/proton/secretStore';
 import { FileSlot } from '../src/fileSlot';
 
 const key = () => randomBytes(32);

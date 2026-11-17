@@ -44,8 +44,8 @@ import { promises as fs, lstatSync, watch as fsWatch } from 'node:fs';
 import type { FSWatcher } from 'node:fs';
 import path from 'node:path';
 
-import { ALWAYS_EXCLUDED } from '../../src/settings';
-import type { Logger } from '../../src/util/logger';
+import { ALWAYS_EXCLUDED } from '../engine/src/settings';
+import type { Logger } from '../engine/src/util/logger';
 import type { VaultEvents } from './ports';
 
 type Log = Pick<Logger, 'debug' | 'info' | 'warn' | 'error'>;

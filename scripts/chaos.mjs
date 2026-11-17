@@ -27,7 +27,7 @@ try {
         outExtension: { '.js': '.cjs' },
         sourcemap: 'inline',
         logLevel: 'warning',
-        alias: { obsidian: path.resolve('../tests/stubs/obsidian.ts') },
+        alias: { obsidian: path.resolve('engine/tests/stubs/obsidian.ts') },
         banner: {
             js:
                 'globalThis.window ??= { setTimeout: (...a) => setTimeout(...a), ' +

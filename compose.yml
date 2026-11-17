@@ -1,0 +1,91 @@
+# pss-daemon — headless Proton Drive sync for an Obsidian vault.
+#
+# Quick start (on the NAS, as admin over SSH):
+#   1. head -c 32 /dev/urandom > pss_key.bin && chmod 600 pss_key.bin
+#      (32 bytes of key material; never commit this file — .gitignore covers it.
+#      Back it up OFF the NAS separately: losing it strands session.bin,
+#      leaking it exposes the session. See SECURITY.md.)
+#   2. Write daemon.json (minimal: {"vaultPath": "/vault",
+#      "remoteFolderUid": "<Drive folder uid>"}), data dir defaults to
+#      /data/pss-daemon, i.e. the pss-data volume below.
+#   3. chown -R 65532:65532 /volume1/vault /volume1/docker/pss-daemon
+#      (see Dockerfile header for why; the daemon fails closed otherwise).
+#   4. docker compose up -d --build
+#      First run: one-off `login` (prints the Proton approval URL), then
+#      `once --pairing=...` for a two-non-empty-sides first sync, then the
+#      service runs `watch` from here.
+#
+# Restart behaviour (read with docker-entrypoint.sh):
+#   restart: "on-failure:5" restarts TRANSIENT failures (exits 1/2/7) up to
+#   5 times, then the container stays STOPPED for a human. Exits 4
+#   (signed out), 5 (already running) and 6 (state lost) are mapped to a
+#   clean stop by the entrypoint wrapper — they need a human (re-login /
+#   restore from backup), and restarting would only hot-loop. After the
+#   bound is hit: `docker compose logs pss-daemon`, fix, then
+#   `docker compose up -d pss-daemon`.
+#
+# Healthcheck: `pss-daemon status` exits 1 when status.json is missing or
+#   older than 90 s, so this checks freshness, not just process liveness.
+#   start_period 15 min covers the first sync of the 134 MB reference vault
+#   on a slow link; a strict supervisor must not kill the container into a
+#   restart loop mid-first-sync. Inherited container env gives the check
+#   the same PSS_CONFIG/PSS_KEY_FILE as the daemon.
+
+services:
+  pss-daemon:
+    build: .
+    image: pss-daemon:local
+    container_name: pss-daemon
+    user: "65532:65532"
+    command: ["watch"]
+    environment:
+      PSS_CONFIG: /data/pss-daemon/daemon.json
+      PSS_KEY_FILE: /run/secrets/pss_key
+    secrets:
+      - pss_key
+    volumes:
+      # Vault bind mount: must be r/w for uid 65532 (see Dockerfile header).
+      - /volume1/vault:/vault:rw
+      # Daemon data dir (daemon.json, session.bin, sync-state.json,
+      # status.json, drive-cache.bin, daemon.lock). Host-local: NEVER share
+      # one data dir between hosts — temp names and device-id assume one
+      # writer on one machine.
+      - pss-data:/data:rw
+    # Resource limits: transfers are block-chunked and the full sync is
+    # stat-bound; 1 CPU / 768 MB is ample (raise transferConcurrency only
+    # if Proton rate-limits stay quiet). Keeps one bad pass from taking
+    # the NAS down; a 300 MB over-cap attachment is streamed, never
+    # double-buffered whole.
+    mem_limit: 768m
+    mem_reservation: 256m
+    cpus: 1.0
+    # The image writes only to /vault and /data; /tmp gets a small tmpfs.
+    # If a future SDK version needs more writable paths, drop `read_only`
+    # (documented fallback — the daemon is unaffected, only the hardening).
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    # JSONL-to-stdout with no rotation would grow the NAS log disk without
+    # bound; Docker logs on the NAS keep these lines indefinitely.
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+    restart: "on-failure:5"
+    healthcheck:
+      test: ["CMD", "pss-daemon", "status"]
+      interval: 60s
+      timeout: 30s
+      retries: 3
+      start_period: 15m
+
+volumes:
+  pss-data:
+    name: pss-daemon-data
+
+secrets:
+  pss_key:
+    # 32 raw bytes, mode 0600, created once per the quick start above.
+    # Compose mounts it at /run/secrets/pss_key (tmpfs, never committed).
+    file: ./pss_key.bin

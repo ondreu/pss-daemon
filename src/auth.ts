@@ -5,12 +5,12 @@ import type { DataAdapter } from 'obsidian';
 
 import { NodeType, NodeWithSameNameExistsValidationError } from '@protontech/drive-sdk';
 
-import { Credentials } from '../../src/proton/credentials';
-import { ProtonSession } from '../../src/proton/session';
-import { UnreadableSlotError } from '../../src/proton/secretStore';
-import { DriveIO } from '../../src/sync/drive';
-import { isSafeName } from '../../src/sync/paths';
-import type { Logger } from '../../src/util/logger';
+import { Credentials } from '../engine/src/proton/credentials';
+import { ProtonSession } from '../engine/src/proton/session';
+import { UnreadableSlotError } from '../engine/src/proton/secretStore';
+import { DriveIO } from '../engine/src/sync/drive';
+import { isSafeName } from '../engine/src/sync/paths';
+import type { Logger } from '../engine/src/util/logger';
 import { FileCacheStore } from './fileCacheStore';
 import { FileSlot } from './fileSlot';
 import type { CreateProtonAuth, ProtonAuth } from './ports';

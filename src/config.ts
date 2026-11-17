@@ -11,7 +11,7 @@
 import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
-import { DEFAULT_SETTINGS, MIN_POLL_SECONDS } from '../../src/settings';
+import { DEFAULT_SETTINGS, MIN_POLL_SECONDS } from '../engine/src/settings';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from './types';
 import { ensurePrivateDir } from './secureFs';
 

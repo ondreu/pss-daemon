@@ -14,7 +14,7 @@
  */
 import { createHash } from 'node:crypto';
 
-import type { SyncPlan, SyncSummary } from '../../src/sync/engine';
+import type { SyncPlan, SyncSummary } from '../engine/src/sync/engine';
 
 /** One path's stable pseudonym. `redactName(x) === redactName(x)`, always. */
 export function redactName(value: string): string {

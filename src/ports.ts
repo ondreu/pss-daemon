@@ -11,9 +11,9 @@
  */
 import type { App } from 'obsidian';
 
-import type { CacheStore } from '../../src/proton/persistentCache';
-import type { ProtonSession } from '../../src/proton/session';
-import type { Logger } from '../../src/util/logger';
+import type { CacheStore } from '../engine/src/proton/persistentCache';
+import type { ProtonSession } from '../engine/src/proton/session';
+import type { Logger } from '../engine/src/util/logger';
 
 /** The vault events the plugin subscribes to on `app.vault`, narrowed to the three the engine consumes. */
 export type VaultEvents = {

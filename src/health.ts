@@ -9,7 +9,7 @@
 import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
-import type { SyncSummary } from '../../src/sync/engine';
+import type { SyncSummary } from '../engine/src/sync/engine';
 import { ensurePrivateDir, privateTempPath } from './secureFs';
 
 /** What the daemon is doing, as far as a supervisor is concerned. */

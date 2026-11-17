@@ -29,7 +29,7 @@ const production = process.argv[2] === 'production';
 const { version } = JSON.parse(readFileSync('./package.json', 'utf8'));
 // The session identifies itself to Proton with the plugin's version, so read it
 // from the manifest the release workflow stamps rather than from this package.
-const { version: pluginVersion } = JSON.parse(readFileSync('../manifest.json', 'utf8'));
+const { version: pluginVersion } = JSON.parse(readFileSync('engine/manifest.json', 'utf8'));
 
 const banner = [
     '#!/usr/bin/env node',
@@ -53,7 +53,7 @@ await esbuild.build({
     target: 'node24',
     conditions: ['browser'],
     define: { __PLUGIN_VERSION__: JSON.stringify(pluginVersion), __DAEMON_VERSION__: JSON.stringify(version) },
-    alias: { obsidian: path.resolve('../tests/stubs/obsidian.ts') },
+    alias: { obsidian: path.resolve('engine/tests/stubs/obsidian.ts') },
     external: builtinModules,
     sourcemap: production ? false : 'inline',
     minify: production,

@@ -16,8 +16,8 @@ import { describe, it } from 'node:test';
 import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
-import { requestStats } from '../../src/util/requestStats';
-import { LARGE_FILE_BYTES } from '../../src/sync/vault';
+import { requestStats } from '../engine/src/util/requestStats';
+import { LARGE_FILE_BYTES } from '../engine/src/sync/vault';
 import {
     CASE_RENAME_FILE,
     LARGE_FILE,

@@ -1,7 +1,7 @@
 {
-    "extends": "../tsconfig.json",
+    "extends": "./engine/tsconfig.json",
     "compilerOptions": {
         "types": ["node"]
     },
-    "include": ["src/**/*.ts", "tests/**/*.ts", "../src/**/*.ts", "../src/**/*.d.ts"]
+    "include": ["src/**/*.ts", "tests/**/*.ts", "engine/src/**/*.ts", "engine/src/**/*.d.ts"]
 }

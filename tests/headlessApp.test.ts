@@ -12,8 +12,8 @@ import { test } from 'node:test';
 
 import { TFile, TFolder } from 'obsidian';
 
-import { Logger } from '../../src/util/logger';
-import { VaultIO } from '../../src/sync/vault';
+import { Logger } from '../engine/src/util/logger';
+import { VaultIO } from '../engine/src/sync/vault';
 import { createHeadlessVault } from '../src/headlessApp';
 import type { VaultEvents } from '../src/ports';
 

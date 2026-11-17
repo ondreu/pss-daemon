@@ -2,8 +2,8 @@
 import { promises as fs } from 'node:fs';
 import { dirname } from 'node:path';
 
-import type { CacheStore, StoredEntry } from '../../src/proton/persistentCache';
-import type { Logger } from '../../src/util/logger';
+import type { CacheStore, StoredEntry } from '../engine/src/proton/persistentCache';
+import type { Logger } from '../engine/src/util/logger';
 
 /** Version of the file below; anything else is corruption. */
 const CACHE_VERSION = 1;

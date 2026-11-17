@@ -30,8 +30,8 @@ import {
     type ProtonDriveClient,
 } from '@protontech/drive-sdk';
 
-import { FakeDrive } from '../../../tests/support/fakes';
-import { requestStats } from '../../../src/util/requestStats';
+import { FakeDrive } from '../../engine/tests/support/fakes';
+import { requestStats } from '../../engine/src/util/requestStats';
 
 /** One observed call into the fake client. `failed` names the error when a fault fired. */
 export type CallRecord = {
