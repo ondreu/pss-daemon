@@ -48,11 +48,6 @@ import {
 
 const full = (world: World, rel: string) => path.join(world.vaultDir, ...rel.split('/'));
 
-async function quietSync(world: World): Promise<void> {
-    world.fault.clearLog();
-    await world.sync();
-}
-
 function mb(bytes: number): Buffer {
     // Deterministic pseudo-random bytes: incompressible enough that hashing
     // costs what real attachments cost, reproducible across runs.
