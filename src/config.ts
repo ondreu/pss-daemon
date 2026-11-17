@@ -31,6 +31,7 @@ const KNOWN_KEYS = new Set([
     'conflictPolicy',
     'massDeleteThreshold',
     'remotePollSeconds',
+    'fullSyncOnStartup',
     'transferConcurrency',
     'pairing',
     'logLevel',
@@ -155,6 +156,15 @@ export function parseDaemonConfig(raw: unknown): { config: DaemonConfig; warning
         fail('"metadataCache" must be "file" or "memory".');
     }
 
+    // A full tree walk on start: the daemon starts rarely, and a saved event
+    // cursor can be past a change that never applied (a config file edited on
+    // another device is the one that hurts). Default true.
+    const fullSyncRaw = raw['fullSyncOnStartup'];
+    const fullSyncOnStartup = fullSyncRaw === undefined ? true : fullSyncRaw;
+    if (typeof fullSyncOnStartup !== 'boolean') {
+        fail('"fullSyncOnStartup" must be true or false.');
+    }
+
     // Opt-in plaintext note names in logs and status.json. Default redacts.
     const namesRaw = raw['logShowsNames'];
     const logShowsNames = namesRaw === undefined ? false : namesRaw;
@@ -171,6 +181,7 @@ export function parseDaemonConfig(raw: unknown): { config: DaemonConfig; warning
             conflictPolicy: conflictPolicy as DaemonConfig['conflictPolicy'],
             massDeleteThreshold,
             remotePollSeconds,
+            fullSyncOnStartup,
             transferConcurrency,
             pairing,
             logLevel: logLevel as DaemonConfig['logLevel'],

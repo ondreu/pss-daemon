@@ -44,13 +44,23 @@ npm run build            # -> dist/pss-daemon.cjs
 
 Node 24 is what CI uses; the bundle is CJS with a shebang and runs on 22+.
 
+Every release also ships the built bundle (`pss-daemon.cjs` plus a `.sha256`)
+and a container image, so a server needs neither Node nor a build:
+
+```sh
+gh release download 0.1.1 -R ondreu/pss-daemon -p pss-daemon.cjs -p '*.sha256'
+sha256sum -c pss-daemon.cjs.sha256
+docker pull ghcr.io/ondreu/pss-daemon:0.1.1
+```
+
 ## Configure and sign in
 
 ```sh
 head -c 32 /dev/urandom > pss_key.bin && chmod 600 pss_key.bin
 cat > daemon.json <<'JSON'
 { "vaultPath": "/srv/vault", "remoteFolderUid": "<Drive folder uid>",
-  "conflictPolicy": "merge" }
+  "conflictPolicy": "merge",
+  "fullSyncOnStartup": true }
 JSON
 
 export PSS_CONFIG=$PWD/daemon.json PSS_KEY_FILE=$PWD/pss_key.bin

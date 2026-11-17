@@ -1,6 +1,6 @@
 {
     "name": "pss-daemon",
-    "version": "0.1.0",
+    "version": "0.1.1",
     "private": true,
     "description": "Headless Proton Drive sync daemon for an Obsidian vault, built on the proton-sdk-sync engine.",
     "license": "GPL-3.0-or-later",

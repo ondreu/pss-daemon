@@ -412,6 +412,7 @@ export function toPluginSettings(config: DaemonConfig, options: { autoSync: bool
         paused: false,
         autoSync: options.autoSync,
         syncOnStartup: true,
+        fullSyncOnStartup: config.fullSyncOnStartup,
         logLevel: config.logLevel,
         deviceName: 'pss-daemon',
     };

@@ -26,6 +26,13 @@ export type DaemonConfig = {
     massDeleteThreshold: number;
     /** Seconds between Drive polls. Floored at MIN_POLL_SECONDS. */
     remotePollSeconds: number;
+    /**
+     * Compare the whole tree on start instead of replaying Drive's events.
+     * A daemon restarts rarely, so it can pay for the walk; and a cursor that
+     * predates a change which then failed to apply would never mention it
+     * again. Default true.
+     */
+    fullSyncOnStartup: boolean;
     transferConcurrency: number;
     /** Only needed when both sides already hold files. */
     pairing: 'adopt-drive' | 'adopt-vault' | 'merge' | null;

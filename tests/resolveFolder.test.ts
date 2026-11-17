@@ -32,6 +32,7 @@ function configFor(dir: string): DaemonConfig {
         conflictPolicy: 'keep-both',
         massDeleteThreshold: 25,
         remotePollSeconds: 60,
+        fullSyncOnStartup: true,
         transferConcurrency: 3,
         pairing: null,
         logLevel: 'info',
