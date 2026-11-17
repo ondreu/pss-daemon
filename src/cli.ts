@@ -1,3 +1,4 @@
+/* eslint-disable obsidianmd/no-nodejs-modules, obsidianmd/no-global-this, obsidianmd/prefer-window-timers, obsidianmd/hardcoded-config-path -- Node-only daemon code: it never runs inside Obsidian and is not part of main.js. */
 /**
  * Argument parsing for `pss-daemon`. No dependency beyond builtins on
  * purpose: ~100 lines of parsing keep the audit surface small (arch doc

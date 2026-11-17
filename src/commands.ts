@@ -1,3 +1,4 @@
+/* eslint-disable obsidianmd/no-nodejs-modules, obsidianmd/no-global-this, obsidianmd/prefer-window-timers, obsidianmd/hardcoded-config-path -- Node-only daemon code: it never runs inside Obsidian and is not part of main.js. */
 /**
  * One function per CLI command. Each takes already-parsed args plus
  * injectable IO/deps, loads the config, and returns an exit code — never

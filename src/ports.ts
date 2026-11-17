@@ -1,3 +1,4 @@
+/* eslint-disable obsidianmd/no-nodejs-modules, obsidianmd/no-global-this, obsidianmd/prefer-window-timers, obsidianmd/hardcoded-config-path -- Node-only daemon code: it never runs inside Obsidian and is not part of main.js. */
 /**
  * The seams between the daemon's three workstreams. Frozen for the scaffold:
  * a stream that cannot meet one of these signatures reports it instead of

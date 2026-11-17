@@ -1,3 +1,4 @@
+/* eslint-disable obsidianmd/no-nodejs-modules, obsidianmd/no-global-this, obsidianmd/prefer-window-timers, obsidianmd/hardcoded-config-path -- Node-only daemon code: it never runs inside Obsidian and is not part of main.js. */
 /**
  * The shapes every headless module shares. Kept deliberately small: the
  * engine already owns the sync types (`../src/sync/types.ts`), so only what is

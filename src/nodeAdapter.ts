@@ -1,3 +1,4 @@
+/* eslint-disable obsidianmd/no-nodejs-modules, obsidianmd/no-global-this, obsidianmd/prefer-window-timers, obsidianmd/hardcoded-config-path -- Node-only daemon code: it never runs inside Obsidian and is not part of main.js. */
 /**
  * A `DataAdapter` over a vault directory on the local disk, for the daemon.
  *
