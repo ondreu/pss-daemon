@@ -377,12 +377,8 @@ describe('steady-state correctness (#11, #12, #19, #20)', () => {
         // Drive to the vault spelling, disambiguated because the NFC twin
         // owns it. Both byte-versions must survive, not collapse.
         await world.sync();
-        console.log('PROBE after 2 syncs remote:', JSON.stringify(world.fault.inner.filePaths().filter((rel) => rel.startsWith('unicode/'))));
-        console.log('PROBE after 2 syncs local:', JSON.stringify((await walkFiles(world.vaultDir)).filter((rel) => rel.startsWith('unicode/'))));
         await world.sync();
-        console.log('PROBE after 3 syncs remote:', JSON.stringify(world.fault.inner.filePaths().filter((rel) => rel.startsWith('unicode/'))));
         await world.sync();
-        console.log('PROBE after 4 syncs remote:', JSON.stringify(world.fault.inner.filePaths().filter((rel) => rel.startsWith('unicode/'))));
 
             const twinBytes = '# Caf\u00e9\n\nsame bytes, either spelling\n';
             const remoteUnicode = world.fault.inner.filePaths().filter((rel) => rel.startsWith('unicode/'));
@@ -469,7 +465,10 @@ describe('fault windows and guards (#17, #23, #24, mass-delete hold)', () => {
 
             // Phase A: burst 429s on per-path lookups. The pass completes with
             // retried paths; failed reads must never read as "remote gone".
-            world.fault.failEvery('getNodeHierarchy', 2, () => {
+            // `iterateNodes` is the per-path lookup the pass actually makes
+            // (DriveIO.lookupNodes batches through it); `getNodeHierarchy`
+            // only resolves the root, so a fault on it never fires mid-pass.
+            world.fault.failEvery('iterateNodes', 3, () => {
                 world.fault.recordRateLimited();
                 return rateLimitedError();
             });
@@ -481,7 +480,7 @@ describe('fault windows and guards (#17, #23, #24, mass-delete hold)', () => {
                 // Contained per-path failures resolve the pass; a wholesale
                 // failure rejects it. Either way nothing may be deleted.
             }
-            assert.ok(world.fault.failedCallsOf('getNodeHierarchy').length > 0, 'the 429s actually fired');
+            assert.ok(world.fault.failedCallsOf('iterateNodes').length > 0, 'the 429s actually fired');
             assert.equal(world.fault.deleteCalls().length, deletesBefore, 'zero deletes during the 429 window');
             assert.notEqual(requestStats.lastRateLimited(), null, 'the 429s reached the shared rate stats');
             world.fault.clearFaults();

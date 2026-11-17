@@ -31,6 +31,7 @@ import { promises as fs } from 'node:fs';
 import path from 'node:path';
 
 import { sha1Hex } from '../tests/support/treeGen';
+import { isConflictCopyOf } from '../../src/sync/paths';
 import { rateLimitedError, serverError } from '../tests/support/faultDrive';
 import { createWorld } from '../tests/support/harness';
 
@@ -82,7 +83,8 @@ type OpKind =
     | 'folder-delete-vs-edit'
     | 'collide'
     | 'truncate'
-    | 'touch';
+    | 'touch'
+    | 'sync';
 
 type LedgerOp = {
     seq: number;
@@ -93,6 +95,8 @@ type LedgerOp = {
     paths: string[];
     /** A delete whose subtree the other side also touched this window: tokens must survive. */
     contested: boolean;
+    /** Free-form direction detail (e.g. which side deleted in a contest). */
+    detail?: string;
 };
 
 type Version = { sha: string; tokens: string[]; path: string };
@@ -133,8 +137,18 @@ async function main(): Promise<void> {
     const versions: Version[] = [];
     const versionShas = new Set<string>();
     const pathTokens = new Map<string, string[]>();
-    const contestedDirs = new Set<string>();
-    const dirtySinceSync = new Set<string>();
+    /** Every file a token was ever recorded under; dir-level ops carry tokens filed under their files. */
+    const tokenFiles = new Map<string, string[]>();
+    /** Contested dir -> passes completed when it was set up; its contest may only run once a sync carried the setup. */
+    const contestedDirs = new Map<string, number>();
+    /**
+     * Paths the other side wrote since the last sync. A delete is contested
+     * only when the *other* side *wrote bytes* in the same window;
+     * two-sided deletes converge to deleted, and same-side churn before a
+     * delete is a clean one-sided delete — neither is a contest.
+     */
+    const dirtyLocalEdit = new Set<string>();
+    const dirtyRemoteEdit = new Set<string>();
     /** Old path -> new path; tokens travel with the content, not the name. */
     const renames = new Map<string, string>();
     const canon = (rel: string): string => {
@@ -176,6 +190,7 @@ async function main(): Promise<void> {
             return;
         }
         pathTokens.set(rel, [...(pathTokens.get(rel) ?? []), token]);
+        tokenFiles.set(token, [...(tokenFiles.get(token) ?? []), rel]);
     };
 
     const logOp = async (op: Omit<LedgerOp, 'seq'>) => {
@@ -185,9 +200,22 @@ async function main(): Promise<void> {
         await appendLine(ledgerPath, entry);
     };
 
-    const markDirty = (rel: string) => {
-        dirtySinceSync.add(rel);
+    const markEditedLocal = (rel: string) => {
+        dirtyLocalEdit.add(rel);
     };
+
+    const markEditedRemote = (rel: string) => {
+        dirtyRemoteEdit.add(rel);
+    };
+
+    /**
+     * Paths the writers may target. The engine never syncs its own invisible
+     * paths (local trash, sync debris): mutating them, or forging them on the
+     * fake Drive, only confuses the ledger, so ops leave them alone.
+     */
+    const ENGINE_INVISIBLE = [/^\.trash(\/|$)/, /^\.proton-sync(\/|$)/];
+    const isEngineInvisible = (rel: string): boolean => ENGINE_INVISIBLE.some((pattern) => pattern.test(rel));
+    const syncableFiles = (rels: string[]): string[] => rels.filter((rel) => !isEngineInvisible(rel) && !rel.startsWith(`${EXCLUDED}/`));
 
     // -- local helpers -------------------------------------------------------
     const localFiles = async (): Promise<string[]> => {
@@ -210,7 +238,7 @@ async function main(): Promise<void> {
     const localWrite = async (rel: string, text: string) => {
         await fs.mkdir(path.dirname(full(rel)), { recursive: true });
         await fs.writeFile(full(rel), text, 'utf8');
-        markDirty(rel);
+        markEditedLocal(rel);
     };
 
     // -- ops -----------------------------------------------------------------
@@ -224,6 +252,7 @@ async function main(): Promise<void> {
         await localWrite(rel, seedContent(token));
         if (random() < 0.5) {
             world.fault.inner.put(rel, seedContent(token));
+            markEditedRemote(rel);
         }
         noteTokens(rel, token);
         await recordVersion(rel, true);
@@ -231,21 +260,21 @@ async function main(): Promise<void> {
     }
 
     async function opAppend(): Promise<void> {
-        const files = (await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED));
+        const files = syncableFiles((await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED)));
         const rel = pick(files);
         if (!rel) {
             return opWriteNew();
         }
         const token = TOKEN(run, seq);
         await fs.appendFile(full(rel), `append ${token}\n${token}\n`, 'utf8');
-        markDirty(rel);
+        markEditedLocal(rel);
         noteTokens(rel, token);
         await recordVersion(rel, true);
         await logOp({ op: 'append', token, paths: [rel], contested: false });
     }
 
     async function opRenameOrMove(): Promise<void> {
-        const files = (await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED));
+        const files = syncableFiles((await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED)));
         const rel = pick(files);
         if (!rel) {
             return opWriteNew();
@@ -254,8 +283,8 @@ async function main(): Promise<void> {
         const next = `${dir === '' ? 'notes' : dir}/renamed-${seq}.md`;
         await fs.mkdir(path.dirname(full(next)), { recursive: true });
         await fs.rename(full(rel), full(next));
-        markDirty(rel);
-        markDirty(next);
+        markEditedLocal(rel);
+        markEditedLocal(next);
         // One-sided local rename: the remote node stays behind, and the
         // engine follows it by content on the next pass.
         const history = pathTokens.get(rel) ?? [];
@@ -266,7 +295,7 @@ async function main(): Promise<void> {
     }
 
     async function opCopy(): Promise<void> {
-        const files = (await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED));
+        const files = syncableFiles((await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED)));
         const rel = pick(files);
         if (!rel) {
             return opWriteNew();
@@ -281,38 +310,39 @@ async function main(): Promise<void> {
     }
 
     async function opDeleteFile(): Promise<void> {
-        const files = (await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED));
+        const files = syncableFiles((await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED)));
         const rel = pick(files);
         if (!rel) {
             return opWriteNew();
         }
-        const contested = dirtySinceSync.has(rel);
-        if (random() < 0.5) {
+        const remote = random() < 0.5;
+        const contested = (remote ? dirtyLocalEdit : dirtyRemoteEdit).has(rel);
+        if (!remote) {
             await fs.unlink(full(rel));
         } else {
             world.fault.inner.trash(rel);
         }
-        markDirty(rel);
         await logOp({ op: 'delete-file', token: null, paths: [rel], contested });
     }
 
     async function opDeleteFolder(): Promise<void> {
-        const dirs = [...contestedDirs].filter((dir) => dir !== '');
+        const dirs = [...contestedDirs.keys()].filter((dir) => dir !== '');
         const dir = pick(dirs) ?? `moved/a${Math.floor(random() * 3)}`;
-        const contested = [...dirtySinceSync].some((rel) => rel === dir || rel.startsWith(`${dir}/`));
-        if (random() < 0.5) {
+        const under = (set: Set<string>): boolean => [...set].some((rel) => rel === dir || rel.startsWith(`${dir}/`));
+        const remote = random() < 0.5;
+        const contested = under(remote ? dirtyLocalEdit : dirtyRemoteEdit);
+        if (!remote) {
             await fs.rm(full(dir), { recursive: true, force: true });
         } else {
             world.fault.inner.trash(dir);
         }
-        markDirty(dir);
         contestedDirs.delete(dir);
         await logOp({ op: 'delete-folder', token: null, paths: [dir], contested });
     }
 
     async function opContestedSetup(): Promise<void> {
         const dir = `contested-${seq}`;
-        contestedDirs.add(dir);
+        contestedDirs.set(dir, passes);
         const token = TOKEN(run, seq);
         await localWrite(`${dir}/note.md`, `# Contested\n\n${token}\n`);
         await localWrite(`${dir}/other.md`, `# Other\n\n${token}\n`);
@@ -323,26 +353,30 @@ async function main(): Promise<void> {
     }
 
     async function opFolderDeleteVsEdit(): Promise<void> {
-        if (contestedDirs.size === 0) {
+        // Only contest a setup a sync has already carried: destroying an
+        // unsynced setup proves nothing — no engine ever saw its tokens.
+        const ready = [...contestedDirs.entries()].filter(([, setupPasses]) => setupPasses < passes).map(([dir]) => dir);
+        if (ready.length === 0) {
             return opContestedSetup();
         }
-        const dir = pick([...contestedDirs])!;
+        const dir = pick(ready)!;
         contestedDirs.delete(dir);
         const token = TOKEN(run, seq);
-        if (random() < 0.5) {
+        const detail = random() < 0.5 ? 'rm-local+put-remote' : 'trash-remote+write-local';
+        if (detail === 'rm-local+put-remote') {
             await fs.rm(full(dir), { recursive: true, force: true });
             world.fault.inner.put(`${dir}/note.md`, `# Contested\n\nremote edit ${token}\n${token}\n`);
+            markEditedRemote(`${dir}/note.md`);
         } else {
             world.fault.inner.trash(dir);
             await localWrite(`${dir}/note.md`, `# Contested\n\nlocal edit ${token}\n${token}\n`);
         }
         noteTokens(`${dir}/note.md`, token);
-        markDirty(`${dir}/note.md`);
-        await logOp({ op: 'folder-delete-vs-edit', token, paths: [dir], contested: true });
+        await logOp({ op: 'folder-delete-vs-edit', token, paths: [dir], contested: true, detail });
     }
 
     async function opCollide(): Promise<void> {
-        const files = (await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED));
+        const files = syncableFiles((await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED)));
         const rel = pick(files) ?? freshPath();
         const localToken = TOKEN(run, seq);
         const remoteToken = `${TOKEN(run, seq)}-remote`;
@@ -354,7 +388,8 @@ async function main(): Promise<void> {
         }
         const remoteBody = world.fault.inner.text(rel) ?? `fresh ${remoteToken}\n`;
         world.fault.inner.put(rel, `${remoteBody}remote ${remoteToken}\n${remoteToken}\n`);
-        markDirty(rel);
+        markEditedLocal(rel);
+        markEditedRemote(rel);
         noteTokens(rel, localToken);
         noteTokens(rel, remoteToken);
         await recordVersion(rel, true);
@@ -363,14 +398,15 @@ async function main(): Promise<void> {
     }
 
     async function opTruncate(): Promise<void> {
-        const files = (await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED));
+        const files = syncableFiles((await localFiles()).filter((rel) => rel.endsWith('.md') && !rel.startsWith(EXCLUDED)));
         const rel = pick(files);
         if (!rel) {
             return opWriteNew();
         }
         await fs.truncate(full(rel), 0);
-        markDirty(rel);
-        await logOp({ op: 'truncate', token: null, paths: [rel], contested: dirtySinceSync.has(rel) });
+        const contested = dirtyRemoteEdit.has(rel);
+        markEditedLocal(rel);
+        await logOp({ op: 'truncate', token: null, paths: [rel], contested });
     }
 
     async function opTouch(): Promise<void> {
@@ -416,7 +452,8 @@ async function main(): Promise<void> {
         await opWriteNew();
     }
     await world.sync();
-    dirtySinceSync.clear();
+    dirtyLocalEdit.clear();
+    dirtyRemoteEdit.clear();
 
     // Background fault weather: occasional 429s and a mid-run 5xx streak, as
     // SDK-shaped errors the engine must ride out without deleting.
@@ -515,13 +552,16 @@ async function main(): Promise<void> {
             // The dead pass may still flush its stale state after the release;
             // the next passes reconverge, which is exactly what is verified.
             await world.sync();
+            await logOp({ op: 'sync', token: null, paths: [], contested: false });
             passes += 2;
         } else {
             await world.sync();
+            await logOp({ op: 'sync', token: null, paths: [], contested: false });
             passes += 1;
         }
         passDurations.push(Date.now() - begin);
-        dirtySinceSync.clear();
+        dirtyLocalEdit.clear();
+        dirtyRemoteEdit.clear();
         await sample(false);
     };
 
@@ -542,7 +582,8 @@ async function main(): Promise<void> {
 
     // -- quiesce -----------------------------------------------------------------
     world.fault.clearFaults();
-    dirtySinceSync.clear();
+    dirtyLocalEdit.clear();
+    dirtyRemoteEdit.clear();
     let lastTransfers = world.fault.completedUploads + world.fault.completedDownloads;
     for (let i = 0; i < 12; i++) {
         const begin = Date.now();
@@ -568,6 +609,15 @@ async function main(): Promise<void> {
     const failures: string[] = [];
     const isExcluded = (rel: string) => rel === EXCLUDED || rel.startsWith(`${EXCLUDED}/`);
     const isCopy = (rel: string) => rel.includes('(conflict ');
+    // Tree equality holds only where the engine syncs: its own invisible
+    // paths (local trash, device records) are storage, not synced state.
+    // Trash still counts for token coverage below — an engine-trashed file
+    // is a byte-complete copy by another name.
+    const isLive = (rel: string): boolean =>
+        !isExcluded(rel) &&
+        !isEngineInvisible(rel) &&
+        rel !== '.proton-drive-sync' &&
+        !rel.startsWith('.proton-drive-sync/');
 
     // Token coverage: every non-deleted token found locally, remotely, or in
     // a complete copy — unless the ledger shows a clean one-sided delete, a
@@ -581,6 +631,9 @@ async function main(): Promise<void> {
         blobs.push({ rel, text: textOf(bytes), sha: sha1Hex(bytes), remote: false });
     }
     for (const rel of world.fault.inner.filePaths()) {
+        if (!isLive(rel)) {
+            continue;
+        }
         const node = world.fault.inner.at(rel);
         if (node?.revision) {
             blobs.push({ rel, text: textOf(node.revision.data), sha: sha1Hex(node.revision.data), remote: true });
@@ -590,6 +643,20 @@ async function main(): Promise<void> {
     for (const blob of blobs) {
         for (const token of tokensIn(blob.text)) {
             foundTokens.add(token);
+        }
+    }
+    // Live equality maps, needed both for the last-writer-wins check below
+    // and the tree comparison after it.
+    const localLiveOf = new Map<string, string>();
+    for (const blob of blobs) {
+        if (!blob.remote && !isCopy(blob.rel) && isLive(blob.rel)) {
+            localLiveOf.set(blob.rel, blob.sha);
+        }
+    }
+    const remoteLiveOf = new Map<string, string>();
+    for (const blob of blobs) {
+        if (blob.remote && !isCopy(blob.rel)) {
+            remoteLiveOf.set(blob.rel, blob.sha);
         }
     }
     const opByToken = new Map<string, LedgerOp>();
@@ -618,17 +685,60 @@ async function main(): Promise<void> {
             continue;
         }
         const canonPaths = op.paths.map(canon);
-        const history = pathTokens.get(canon(op.paths[0])) ?? [];
+        const filedUnder = new Set<string>(canonPaths);
+        for (const file of tokenFiles.get(token) ?? []) {
+            filedUnder.add(canon(file));
+        }
+        const history = [...filedUnder].flatMap((file) => pathTokens.get(file) ?? []);
         const later = history.slice(history.indexOf(token) + 1);
         const superseded = later.some((laterToken) => foundTokens.has(laterToken));
+        const onSamePath = (p: string): boolean =>
+            [...filedUnder].some((mine) => mine === p || mine.startsWith(`${p}/`) || p.startsWith(`${mine}/`) || isConflictCopyOf(p, mine));
         const deletedAfter = ops.some(
             (other) =>
                 other.seq > op.seq &&
                 (other.op === 'delete-file' || other.op === 'delete-folder') &&
-                other.paths.map(canon).some((p) => canonPaths.some((mine) => mine === p || mine.startsWith(`${p}/`))) &&
+                other.paths.map(canon).some(onSamePath) &&
                 !other.contested,
         );
-        if (isExcluded(op.paths[0]) || ((superseded || deletedAfter) && !op.contested && op.op !== 'collide')) {
+        // A clean truncate is an edit that removes lines, like the
+        // last-writer-wins sequential edits the plan excuses.
+        const truncatedAfter = ops.some(
+            (other) =>
+                other.seq > op.seq &&
+                other.op === 'truncate' &&
+                other.paths.map(canon).some(onSamePath) &&
+                !other.contested,
+        );
+        // A later contest consumed this file: the harness deleted or
+        // overwrote its subtree as policy. Excused for ordinary tokens when
+        // the contest's own edit demonstrably survived — then the rest is
+        // legitimate fallout, not engine loss. Conflict tokens keep their
+        // strict rules: the engine owed them a complete copy.
+        const contestSealed =
+            op.op !== 'collide' &&
+            op.op !== 'folder-delete-vs-edit' &&
+            ops.some(
+                (other) =>
+                    other.seq > op.seq &&
+                    other.op === 'folder-delete-vs-edit' &&
+                    other.paths.map(canon).some(onSamePath) &&
+                    other.token !== null &&
+                    foundTokens.has(other.token),
+            );
+        // A collide decided by last-writer-wins: no copies were produced, the
+        // live file converged on both sides, and the surviving side's token
+        // is there. The race dropped a line; the plan excuses exactly this.
+        const siblingWon =
+            op.op === 'collide' &&
+            [op.token, ...(op.extraTokens ?? [])].some((sibling) => sibling !== token && foundTokens.has(sibling)) &&
+            canonPaths.every(
+                (mine) =>
+                    localLiveOf.has(mine) &&
+                    localLiveOf.get(mine) === remoteLiveOf.get(mine) &&
+                    !blobs.some((blob) => isConflictCopyOf(blob.rel, mine)),
+            );
+        if (isExcluded(op.paths[0]) || superseded || deletedAfter || truncatedAfter || contestSealed || siblingWon) {
             tokensExcused += 1;
             continue;
         }
@@ -636,6 +746,32 @@ async function main(): Promise<void> {
     }
     if (lost.length > 0) {
         failures.push(`P0 lost tokens (${lost.length}): ${lost.slice(0, 10).join(', ')}`);
+    }
+    // Failure forensics: for every lost token, what later ops touched its
+    // paths and which blobs still mention them. Written only on failure.
+    if (lost.length > 0) {
+        const forensics = lost.slice(0, 20).map((token) => {
+            const op = opByToken.get(token)!;
+            const mine = new Set(op.paths.map(canon));
+            for (const file of tokenFiles.get(token) ?? []) {
+                mine.add(canon(file));
+            }
+            const laterOps = ops
+                .filter(
+                    (other) =>
+                        other.seq > op.seq &&
+                        other.op !== 'sync' &&
+                        other.paths.map(canon).some((p) =>
+                            [...mine].some((m) => m === p || m.startsWith(`${p}/`) || p.startsWith(`${m}/`) || isConflictCopyOf(p, m)),
+                        ),
+                )
+                .map((other) => ({ seq: other.seq, op: other.op, token: other.token, contested: other.contested, detail: other.detail ?? null }));
+            const nearby = blobs
+                .filter((blob) => [...mine].some((m) => blob.rel === m || blob.rel.startsWith(`${m}/`) || m.startsWith(`${blob.rel}/`)))
+                .map((blob) => ({ rel: blob.rel, remote: blob.remote, sha: blob.sha.slice(0, 8), lines: blob.text.split('\n').filter((line) => line.startsWith(`tok-${run}-`)) }));
+            return { token, op: { seq: op.seq, op: op.op, paths: op.paths }, laterOps, nearby };
+        });
+        await appendLine(samplesPath, { forensics: true, lost: forensics });
     }
 
     // Copies complete: every conflict copy's bytes must equal a recorded
@@ -657,18 +793,8 @@ async function main(): Promise<void> {
     }
 
     // Tree equality modulo exclusions: live paths match by hash on both sides.
-    const localLive = new Map<string, string>();
-    for (const blob of blobs) {
-        if (!blob.remote && !isCopy(blob.rel)) {
-            localLive.set(blob.rel, blob.sha);
-        }
-    }
-    const remoteLive = new Map<string, string>();
-    for (const blob of blobs) {
-        if (blob.remote && !isCopy(blob.rel)) {
-            remoteLive.set(blob.rel, blob.sha);
-        }
-    }
+    const localLive = localLiveOf;
+    const remoteLive = remoteLiveOf;
     const missingRemote = [...localLive.keys()].filter((rel) => !remoteLive.has(rel));
     const missingLocal = [...remoteLive.keys()].filter((rel) => !localLive.has(rel));
     const diverged = [...localLive.keys()].filter((rel) => remoteLive.has(rel) && remoteLive.get(rel) !== localLive.get(rel));
@@ -679,8 +805,20 @@ async function main(): Promise<void> {
         );
     }
     // Copies converge too: the same copy set on both sides.
-    const localCopies = new Set(blobs.filter((blob) => !blob.remote && isCopy(blob.rel)).map((blob) => `${blob.rel}:${blob.sha}`));
-    const remoteCopies = new Set(blobs.filter((blob) => blob.remote && isCopy(blob.rel)).map((blob) => `${blob.rel}:${blob.sha}`));
+    const liveCopyKey = (blob: { rel: string; sha: string }): string | null =>
+        isLive(blob.rel) ? `${blob.rel}:${blob.sha}` : null;
+    const localCopies = new Set(
+        blobs
+            .filter((blob) => !blob.remote && isCopy(blob.rel))
+            .map(liveCopyKey)
+            .filter((key): key is string => key !== null),
+    );
+    const remoteCopies = new Set(
+        blobs
+            .filter((blob) => blob.remote && isCopy(blob.rel))
+            .map(liveCopyKey)
+            .filter((key): key is string => key !== null),
+    );
     const copyDiff = [...localCopies, ...remoteCopies].filter((key) => !(localCopies.has(key) && remoteCopies.has(key)));
     if (copyDiff.length > 0) {
         failures.push(`P0 conflict-copy asymmetry (${copyDiff.length}): ${copyDiff.slice(0, 5).join(', ')}`);
