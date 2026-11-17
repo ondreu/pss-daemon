@@ -5,6 +5,11 @@
  * engine's settings module stays reachable through `--probe`, the cheapest
  * smoke test that the shared `src` is bundled.
  */
+// First, before anything that can reach SDK code: the SDK bundles no
+// polyfills, and its base64/hex helpers throw a bare TypeError when missing.
+// The plugin does the same in src/main.ts.
+import '../../src/polyfills';
+
 import { DEFAULT_SETTINGS } from '../../src/settings';
 import { parseArgs, USAGE } from './cli';
 import { runCommand } from './commands';
