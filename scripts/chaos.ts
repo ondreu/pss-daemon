@@ -684,6 +684,46 @@ async function main(): Promise<void> {
     let tokensCovered = 0;
     let tokensExcused = 0;
     const lost: string[] = [];
+    // Whether a token's disappearance is ledger-proven harness policy: a
+    // later token on the same path survived it, or a later clean (one-sided,
+    // non-contested) delete or truncate removed its file. Contested ops
+    // never excuse — a file the other side also touched must survive.
+    const goneByCleanPolicy = (target: LedgerOp): boolean => {
+        if (target.token === null) {
+            return false;
+        }
+        const targetFiled = new Set<string>(target.paths.map(canon));
+        for (const file of tokenFiles.get(target.token) ?? []) {
+            targetFiled.add(canon(file));
+        }
+        const targetHistory = [...targetFiled].flatMap((file) => pathTokens.get(file) ?? []);
+        const targetIndex = targetHistory.indexOf(target.token);
+        if (targetIndex !== -1 && targetHistory.slice(targetIndex + 1).some((laterToken) => foundTokens.has(laterToken))) {
+            return true;
+        }
+        const onTargetPath = (p: string): boolean =>
+            [...targetFiled].some(
+                (mine) => mine === p || mine.startsWith(`${p}/`) || p.startsWith(`${mine}/`) || isConflictCopyOf(p, mine),
+            );
+        if (
+            ops.some(
+                (other) =>
+                    other.seq > target.seq &&
+                    (other.op === 'delete-file' || other.op === 'delete-folder') &&
+                    other.paths.map(canon).some(onTargetPath) &&
+                    !other.contested,
+            )
+        ) {
+            return true;
+        }
+        return ops.some(
+            (other) =>
+                other.seq > target.seq &&
+                other.op === 'truncate' &&
+                other.paths.map(canon).some(onTargetPath) &&
+                !other.contested,
+        );
+    };
     for (const { token, op } of coverTokens) {
         tokensCreated += 1;
         if (foundTokens.has(token)) {
@@ -746,14 +786,16 @@ async function main(): Promise<void> {
             );
         // A collide resolved by keep-both, then swept away by a later folder
         // contest: the engine demonstrably kept both versions (a kept-both
-        // conflict event on this file), the folder contest settled correctly
-        // (its own edit token survived), and the file plus its copies are gone
-        // on BOTH sides. That is converged deletion by policy — the local
-        // folder delete propagated to a sibling the surviving side never
-        // rewrote — not a dropped edit. All three legs are required: without
-        // the kept-both event this would hide an engine that dropped a side
-        // without copying; without both-sides absence a lingering copy stays
-        // a strict loss/divergence.
+        // conflict event on this file), the folder contest settled correctly,
+        // and the file plus its copies are gone on BOTH sides. Settling
+        // correctly means the contest's own edit token survived, or vanished
+        // only through later ledger-proven clean policy (a one-sided delete
+        // or truncate the harness itself ordered — seed 11 truncates one
+        // contest file at seq 715 and clean-deletes the other's folder at
+        // 4112). All three legs are required: without the kept-both event
+        // this would hide an engine that dropped a side without copying;
+        // without both-sides absence a lingering copy stays a strict
+        // loss/divergence.
         const folderContestSealed =
             op.op === 'collide' &&
             ops.some(
@@ -762,7 +804,7 @@ async function main(): Promise<void> {
                     other.op === 'folder-delete-vs-edit' &&
                     other.paths.map(canon).some(onSamePath) &&
                     other.token !== null &&
-                    foundTokens.has(other.token),
+                    (foundTokens.has(other.token) || goneByCleanPolicy(other)),
             ) &&
             world.conflicts.some(
                 (event) =>
