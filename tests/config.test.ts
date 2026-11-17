@@ -177,7 +177,10 @@ test('loadKeyMaterial takes 32 bytes from PSS_KEY_FILE only', async () => {
         }
         writeFileSync(keyFile, Buffer.concat([withNewline, Buffer.from('\n')]));
         assert.equal((await loadKeyMaterial({ PSS_KEY_FILE: keyFile })).length, 32);
-        writeFileSync(keyFile, randomBytes(10));
+        // Pinned, not random: a random 10-byte buffer ends in 0x0a about once
+        // in 256 runs, and the trailing-newline tolerance would then report 9
+        // bytes and fail the assertion below at random.
+        writeFileSync(keyFile, Buffer.from('0123456789'));
         await assert.rejects(loadKeyMaterial({ PSS_KEY_FILE: keyFile }), /10 bytes/);
         await assert.rejects(loadKeyMaterial({}), /PSS_KEY_FILE is not set/);
         await assert.rejects(loadKeyMaterial({ PSS_KEY_FILE: path.join(dir, 'nope') }), /Could not read/);
