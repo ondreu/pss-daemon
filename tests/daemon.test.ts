@@ -404,7 +404,7 @@ test('a held lock exits 5 and never starts the engine', async () => {
     }
 });
 
-test('a held mass delete exits 3 with the paths in the health file', async () => {
+test('a held mass delete exits 3 with redacted paths in the health file', async () => {
     const env = tempEnv();
     try {
         const { io, stdout } = testIO(env.env);
@@ -412,8 +412,31 @@ test('a held mass delete exits 3 with the paths in the health file', async () =>
         const engine = fakeEngineFns({ held: { count: 2, paths: ['gone/a.md', 'gone/b.md'] } });
         const deps = depsFor({ engine: engine.engine });
         assert.equal(await runDaemon({ config, paths, mode: 'once', deps, io, env: env.env, emitter: fakeEmitter() }), ExitCode.MassDeleteHeld);
-        assert.deepEqual((await readHealthFile(paths.healthFile))?.massDeleteHeld, ['gone/a.md', 'gone/b.md']);
+        const held = (await readHealthFile(paths.healthFile))?.massDeleteHeld;
+        assert.equal(held?.length, 2, 'the hold count is untouched');
+        for (const entry of held ?? []) {
+            assert.match(entry, /^<redacted:[0-9a-f]{8}>$/, 'health-file paths redact by default');
+        }
         assert.match(stdout.join('\n'), /Held 2 deletions/);
+        assert.doesNotMatch(stdout.join('\n'), /gone\//);
+    } finally {
+        env.cleanup();
+    }
+});
+
+test('a held mass delete names paths with show-names', async () => {
+    const env = tempEnv();
+    try {
+        const { io, stdout } = testIO(env.env);
+        const { config, paths } = baseConfig(env);
+        const engine = fakeEngineFns({ held: { count: 2, paths: ['gone/a.md', 'gone/b.md'] } });
+        const deps = depsFor({ engine: engine.engine });
+        assert.equal(
+            await runDaemon({ config, paths, mode: 'once', showNames: true, deps, io, env: env.env, emitter: fakeEmitter() }),
+            ExitCode.MassDeleteHeld,
+        );
+        assert.deepEqual((await readHealthFile(paths.healthFile))?.massDeleteHeld, ['gone/a.md', 'gone/b.md']);
+        assert.match(stdout.join('\n'), /gone\/a\.md/);
     } finally {
         env.cleanup();
     }

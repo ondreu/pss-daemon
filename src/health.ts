@@ -5,10 +5,11 @@
  * sees a torn write; read back by `status` and by the compose healthcheck,
  * which cares about freshness, not just process liveness.
  */
-import { mkdir, readFile, rename, writeFile } from 'node:fs/promises';
+import { chmod, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { SyncSummary } from '../../src/sync/engine';
+import { ensurePrivateDir, privateTempPath } from './secureFs';
 
 /** What the daemon is doing, as far as a supervisor is concerned. */
 export type DaemonState = 'starting' | 'idle' | 'syncing' | 'error' | 'signed-out' | 'mass-delete-held' | 'stopped' | 'unknown';
@@ -104,10 +105,21 @@ export async function readHealthFile(healthPath: string): Promise<HealthFile | n
     }
 }
 
-/** Atomic: write beside the target, then rename over it. */
+/** Atomic: write beside the target, then rename over it. Owner-only: the file carries note names. */
 export async function writeHealthFile(healthPath: string, health: HealthFile): Promise<void> {
-    await mkdir(path.dirname(healthPath), { recursive: true });
-    const tmp = `${healthPath}.${process.pid}.tmp`;
-    await writeFile(tmp, JSON.stringify(health), 'utf8');
-    await rename(tmp, healthPath);
+    await ensurePrivateDir(path.dirname(healthPath));
+    // Unique per call: the heartbeat and the pass end can write concurrently,
+    // and a shared temp name lets one rename the other's file away mid-write.
+    const tmp = privateTempPath(healthPath);
+    try {
+        await writeFile(tmp, JSON.stringify(health), { encoding: 'utf8', mode: 0o600 });
+        // A reused temp name keeps its old mode; the published file is what matters.
+        await chmod(tmp, 0o600).catch(() => undefined);
+        await rename(tmp, healthPath);
+        // Heal a file an older version left readable by everyone.
+        await chmod(healthPath, 0o600).catch(() => undefined);
+    } catch (error) {
+        await unlink(tmp).catch(() => undefined);
+        throw error;
+    }
 }

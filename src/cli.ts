@@ -22,6 +22,10 @@ export type ParsedArgs = {
     pairing?: string;
     /** `--import-state PATH`: one-time copy of a GUI state file (login only). */
     importState?: string;
+    /** `--show-names`: log and report plaintext note names (default redacts). */
+    showNames?: boolean;
+    /** `--rotate-key` / `--force`: let login replace an unreadable session.bin. */
+    rotateKey?: boolean;
     help?: boolean;
     version?: boolean;
     probe?: boolean;
@@ -50,6 +54,8 @@ Flags:
   --dry-run            plan the first sync without touching either side (once only)
   --pairing MODE       adopt-drive | adopt-vault | merge (first sync of two non-empty sides)
   --import-state PATH  copy a GUI sync-state.json once (login only)
+  --show-names         log and report plaintext note names (default redacts them)
+  --rotate-key         let login replace a session.bin the current key cannot open
 
 Exit codes: 0 clean · 1 usage · 2 item failures · 3 mass-delete held ·
             4 signed out · 5 already running · 6 state lost · 7 config invalid
@@ -81,6 +87,10 @@ export function parseArgs(argv: string[]): ParsedArgs {
             parsed.json = true;
         } else if (arg === '--dry-run') {
             parsed.dryRun = true;
+        } else if (arg === '--show-names') {
+            parsed.showNames = true;
+        } else if (arg === '--rotate-key' || arg === '--force') {
+            parsed.rotateKey = true;
         } else if (arg === '--config') {
             const value = argv[i + 1];
             if (value === undefined || value.startsWith('-')) {
@@ -140,6 +150,9 @@ export function parseArgs(argv: string[]): ParsedArgs {
     }
     if (parsed.importState !== undefined && parsed.command !== undefined && parsed.command !== 'login') {
         return fail('--import-state only applies to `login`.');
+    }
+    if (parsed.rotateKey === true && parsed.command !== undefined && parsed.command !== 'login') {
+        return fail('--rotate-key only applies to `login`.');
     }
     if (parsed.command === undefined && parsed.help !== true && parsed.version !== true && parsed.probe !== true) {
         return fail('No command given.');

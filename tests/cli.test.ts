@@ -28,6 +28,10 @@ test('every command parses, with its flags', () => {
     assert.equal(full.json, true);
     assert.equal(parseArgs(['--config=/x.json', 'status']).config, '/x.json');
     assert.equal(parseArgs(['login', '--import-state', '/s.json', '--pairing=merge']).importState, '/s.json');
+    assert.equal(parseArgs(['once', '--show-names']).showNames, true);
+    assert.equal(parseArgs(['watch', '--show-names']).showNames, true);
+    assert.equal(parseArgs(['login', '--rotate-key']).rotateKey, true);
+    assert.equal(parseArgs(['login', '--force']).rotateKey, true);
 });
 
 test('bad input explains itself without throwing', () => {
@@ -40,6 +44,7 @@ test('bad input explains itself without throwing', () => {
         ['once', '--pairing', 'merge-theirs'],
         ['watch', '--dry-run'],
         ['once', '--import-state', '/s.json'],
+        ['once', '--rotate-key'],
         [],
     ]) {
         const parsed = parseArgs(argv);

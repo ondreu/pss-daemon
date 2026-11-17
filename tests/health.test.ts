@@ -3,6 +3,7 @@
  */
 import assert from 'node:assert/strict';
 import { mkdtempSync, readdirSync, rmSync } from 'node:fs';
+import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import path from 'node:path';
 import { test } from 'node:test';
@@ -54,6 +55,30 @@ test('writes are atomic: no temp residue, missing reads as null', async () => {
         );
         await writeHealthFile(file, emptyHealth('idle'));
         assert.equal((await readHealthFile(file))?.state, 'idle');
+    } finally {
+        rmSync(root, { recursive: true, force: true });
+    }
+});
+
+test('concurrent writes never fail and leave a parseable file', async () => {
+    const root = dir();
+    try {
+        const file = path.join(root, 'status.json');
+        // The heartbeat and the pass end publish concurrently; with one shared
+        // temp name the loser's tmp was renamed away mid-write (ENOENT).
+        await Promise.all(
+            Array.from({ length: 20 }, (_, i) => writeHealthFile(file, { ...emptyHealth('syncing'), pendingConflicts: i })),
+        );
+        const back = await readHealthFile(file);
+        assert.equal(back?.state, 'syncing');
+        assert.equal(
+            readdirSync(root).filter((name) => name.endsWith('.tmp')).length,
+            0,
+            'no temp debris after concurrent writes',
+        );
+        // And the bytes on disk are always whole JSON, never a torn mix.
+        const raw = await readFile(file, 'utf8');
+        assert.doesNotThrow(() => JSON.parse(raw));
     } finally {
         rmSync(root, { recursive: true, force: true });
     }

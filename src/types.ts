@@ -34,6 +34,11 @@ export type DaemonConfig = {
      * trades a slower start for less on disk.
      */
     metadataCache: 'file' | 'memory';
+    /**
+     * Opt-in plaintext note names in logs and `status.json`. Default false:
+     * structured note paths redact to a stable digest instead.
+     */
+    logShowsNames: boolean;
 };
 
 export type DaemonPaths = {

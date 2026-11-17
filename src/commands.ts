@@ -110,17 +110,17 @@ export async function runCommand(parsed: ParsedArgs, options: CommandDeps = {}):
     try {
         switch (command) {
             case 'login':
-                return await runLogin({ ...base, configFile: resolveConfigPath(parsed.config, env), importState: parsed.importState, pairing: parsed.pairing ?? null });
+                return await runLogin({ ...base, configFile: resolveConfigPath(parsed.config, env), importState: parsed.importState, pairing: parsed.pairing ?? null, rotateKey: parsed.rotateKey ?? false, showNames: parsed.showNames });
             case 'once':
-                return await runDaemon({ ...base, mode: 'once', pairing: parsed.pairing ?? null, dryRun: parsed.dryRun, json: parsed.json });
+                return await runDaemon({ ...base, mode: 'once', pairing: parsed.pairing ?? null, dryRun: parsed.dryRun, json: parsed.json, showNames: parsed.showNames });
             case 'watch':
-                return await runDaemon({ ...base, mode: 'watch', pairing: parsed.pairing ?? null });
+                return await runDaemon({ ...base, mode: 'watch', pairing: parsed.pairing ?? null, showNames: parsed.showNames });
             case 'verify':
-                return await runVerify({ ...base, json: parsed.json });
+                return await runVerify({ ...base, json: parsed.json, showNames: parsed.showNames });
             case 'approve-mass-delete':
-                return await runMassDecision({ ...base, approve: true, pairing: parsed.pairing ?? null });
+                return await runMassDecision({ ...base, approve: true, pairing: parsed.pairing ?? null, showNames: parsed.showNames });
             case 'deny-mass-delete':
-                return await runMassDecision({ ...base, approve: false, pairing: parsed.pairing ?? null });
+                return await runMassDecision({ ...base, approve: false, pairing: parsed.pairing ?? null, showNames: parsed.showNames });
             case 'sign-out':
                 return await runSignOut(base);
         }

@@ -112,6 +112,12 @@ test('pairing, log level, cache and configDir are validated', () => {
     assert.equal(config.metadataCache, 'memory');
 });
 
+test('logShowsNames defaults to redaction and only accepts a boolean', () => {
+    assert.equal(parseDaemonConfig(minimal()).config.logShowsNames, false);
+    assert.equal(parseDaemonConfig(minimal({ logShowsNames: true })).config.logShowsNames, true);
+    assert.throws(() => parseDaemonConfig(minimal({ logShowsNames: 'yes' })), /logShowsNames/);
+});
+
 test('resolveConfigPath prefers --config, then PSS_CONFIG, then the default', () => {
     assert.equal(resolveConfigPath('/x.json', { PSS_CONFIG: '/y.json' }), '/x.json');
     assert.equal(resolveConfigPath(undefined, { PSS_CONFIG: '/y.json' }), '/y.json');

@@ -7,11 +7,12 @@
  * appear here — the only environment inputs are `PSS_CONFIG` (which file to
  * read) and `PSS_KEY_FILE` (key material for the session file at rest).
  */
-import { mkdir, readFile, stat } from 'node:fs/promises';
+import { readFile, stat } from 'node:fs/promises';
 import path from 'node:path';
 
 import { DEFAULT_SETTINGS, MIN_POLL_SECONDS } from '../../src/settings';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from './types';
+import { ensurePrivateDir } from './secureFs';
 
 export const DEFAULT_DATA_DIR = '/data/pss-daemon';
 export const DEFAULT_CONFIG_PATH = path.join(DEFAULT_DATA_DIR, 'daemon.json');
@@ -33,6 +34,7 @@ const KNOWN_KEYS = new Set([
     'pairing',
     'logLevel',
     'metadataCache',
+    'logShowsNames',
 ]);
 
 const CONFLICT_POLICIES: DaemonConfig['conflictPolicy'][] = ['keep-both', 'merge', 'prefer-local', 'prefer-remote'];
@@ -147,6 +149,13 @@ export function parseDaemonConfig(raw: unknown): { config: DaemonConfig; warning
         fail('"metadataCache" must be "file" or "memory".');
     }
 
+    // Opt-in plaintext note names in logs and status.json. Default redacts.
+    const namesRaw = raw['logShowsNames'];
+    const logShowsNames = namesRaw === undefined ? false : namesRaw;
+    if (typeof logShowsNames !== 'boolean') {
+        fail('"logShowsNames" must be true or false.');
+    }
+
     return {
         config: {
             vaultPath,
@@ -160,6 +169,7 @@ export function parseDaemonConfig(raw: unknown): { config: DaemonConfig; warning
             pairing,
             logLevel: logLevel as DaemonConfig['logLevel'],
             metadataCache,
+            logShowsNames,
         },
         warnings,
     };
@@ -217,7 +227,7 @@ export async function ensureDaemonDirs(config: DaemonConfig): Promise<void> {
         fail(`The vault at ${config.vaultPath} is not a directory.`);
     }
     try {
-        await mkdir(config.dataDir, { recursive: true });
+        await ensurePrivateDir(config.dataDir);
     } catch (error) {
         fail(`Could not create the data dir at ${config.dataDir}: ${error instanceof Error ? error.message : String(error)}`);
     }

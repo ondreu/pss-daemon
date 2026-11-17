@@ -14,7 +14,7 @@
  * breaks the build instead of showing up as a runtime "seam" error.
  */
 import { createHash, randomUUID } from 'node:crypto';
-import { lstat, mkdir, open, readdir, readFile, rename, stat, unlink, writeFile } from 'node:fs/promises';
+import { lstat, open, readdir, readFile, rename, stat, unlink, writeFile, chmod } from 'node:fs/promises';
 import path from 'node:path';
 
 import type { ProtonDriveClient } from '@protontech/drive-sdk';
@@ -28,12 +28,14 @@ import { DESKTOP } from '../../src/sync/engine/types';
 import { SyncState } from '../../src/sync/state';
 import type { SyncRecord } from '../../src/sync/types';
 import { Logger } from '../../src/util/logger';
-import { createProtonAuth } from './auth';
+import { createProtonAuth, describeSlot } from './auth';
 import { ConfigError, ensureDaemonDirs, loadKeyMaterial, vaultLockFile } from './config';
 import { createHeadlessVault } from './headlessApp';
 import { acquireDaemonLocks, LockHeldError, releaseLocks, type DaemonLock, type LockProbe } from './lock';
 import { emptyHealth, writeHealthFile, type DaemonState, type HealthFile } from './health';
 import { fsyncDir } from './nodeAdapter';
+import { redactName, redactPathList, redactPlan, redactSummary } from './redaction';
+import { ensurePrivateDir, privateTempPath } from './secureFs';
 import type { CreateHeadlessVault, CreateProtonAuth, HeadlessVault } from './ports';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from './types';
 
@@ -162,9 +164,9 @@ export function jsonLog(io: DaemonIO, level: string, module: string, message: st
  * directory-durability guarantee below is proven against this class.
  *
  * The data dir must be host-local (like the lock assumes): temp names are
- * pid-scoped, and two machines sharing one data dir would trade device ids
- * and clobber each other's state. Nothing here protects against that
- * layout; the config validation only refuses the vault itself.
+ * pid-plus-random scoped, and two machines sharing one data dir would trade
+ * device ids and clobber each other's state. Nothing here protects against
+ * that layout; the config validation only refuses the vault itself.
  */
 export class DataDirAdapter {
     /**
@@ -202,17 +204,27 @@ export class DataDirAdapter {
      * reading a present record for an absent file (which would delete-remote).
      */
     async write(filePath: string, text: string): Promise<void> {
-        await mkdir(path.dirname(filePath), { recursive: true });
-        const tmp = `${filePath}.${process.pid}.tmp`;
-        await writeFile(tmp, text, 'utf8');
-        const handle = await open(tmp, 'r');
+        await ensurePrivateDir(path.dirname(filePath));
+        const tmp = privateTempPath(filePath);
         try {
-            await handle.sync();
-        } finally {
-            await handle.close();
+            await writeFile(tmp, text, { encoding: 'utf8', mode: 0o600 });
+            // A reused temp name keeps its old mode; the published file is what matters.
+            await chmod(tmp, 0o600).catch(() => undefined);
+            const handle = await open(tmp, 'r');
+            try {
+                await handle.sync();
+            } finally {
+                await handle.close();
+            }
+            await rename(tmp, filePath);
+            // Heal a state file an older version left readable by everyone: it
+            // carries note names and hashes.
+            await chmod(filePath, 0o600).catch(() => undefined);
+            await fsyncDir(path.dirname(filePath), this.onDirSync);
+        } catch (error) {
+            await unlink(tmp).catch(() => undefined);
+            throw error;
         }
-        await rename(tmp, filePath);
-        await fsyncDir(path.dirname(filePath), this.onDirSync);
     }
 
     async remove(filePath: string): Promise<void> {
@@ -310,8 +322,10 @@ export async function readClientUid(dataDir: string): Promise<string> {
         // First start: create it below.
     }
     const created = randomUUID();
-    await mkdir(dataDir, { recursive: true });
-    await writeFile(file, created + '\n', 'utf8');
+    await ensurePrivateDir(dataDir);
+    await writeFile(file, created + '\n', { encoding: 'utf8', mode: 0o600 });
+    // Heal an id file an older version left readable by everyone.
+    await chmod(file, 0o600).catch(() => undefined);
     return created;
 }
 
@@ -469,6 +483,8 @@ export type BootRequest = {
     pairing?: string | null;
     /** Read-only preview: the pairing gate is skipped, nothing is written. */
     dryRun?: boolean;
+    /** Opt-in plaintext note names for this run; falls back to the config. */
+    showNames?: boolean;
     deps?: DaemonDeps;
     io?: DaemonIO;
     env?: NodeJS.ProcessEnv;
@@ -505,10 +521,20 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
     const paths = request.paths;
 
     await ensureDaemonDirs(config);
+    // Note names redact by default; `--show-names` (or `logShowsNames` in
+    // daemon.json) opts back into plaintext for this run.
+    const showNames = request.showNames ?? config.logShowsNames ?? false;
     let lastHealth: HealthFile = { ...emptyHealth('starting'), updatedAt: new Date().toISOString() };
     const writeHealth = async (update: Partial<HealthFile> & { state: DaemonState }): Promise<HealthFile> => {
         lastHealth = { ...lastHealth, ...update, updatedAt: new Date().toISOString() };
-        await writeHealthFile(paths.healthFile, lastHealth);
+        // Redact on the way to disk only: in memory the daemon keeps working
+        // with real paths, while `status.json` (readable by log shippers and
+        // backup readers) carries digests instead.
+        await writeHealthFile(paths.healthFile, {
+            ...lastHealth,
+            lastSummary: lastHealth.lastSummary === null ? null : redactSummary(lastHealth.lastSummary, showNames),
+            massDeleteHeld: redactPathList(lastHealth.massDeleteHeld, showNames),
+        });
         return lastHealth;
     };
     await writeHealth({ state: 'starting' });
@@ -589,6 +615,23 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
             return { exitCode: ExitCode.SignedOut };
         }
         if (!restored) {
+            // `Credentials.load` swallows an unreadable slot into "nothing
+            // stored" — but a file this key cannot open is not "signed out".
+            // Tell the two apart before reporting, or a rotated key reads as
+            // a Proton problem and the next login destroys the old envelope.
+            const keyMismatch = (await describeSlot(config.dataDir, key).catch(() => 'missing' as const)) === 'unreadable';
+            if (keyMismatch) {
+                const keyFile = env['PSS_KEY_FILE'];
+                const message =
+                    `The saved session cannot be opened with the key from ${keyFile}: wrong or rotated key. ` +
+                    `This is not a Proton sign-in problem — refusing to run rather than replacing the session. ` +
+                    `Back up the data dir, then run \`login --rotate-key\` once the right key file is in place.`;
+                jsonLog(io, 'error', 'auth', message);
+                await writeHealth({ state: 'error', error: message });
+                await vault.close().catch(() => undefined);
+                await cleanup();
+                return { exitCode: ExitCode.ConfigInvalid };
+            }
             jsonLog(io, 'error', 'auth', 'No saved session. Run `pss-daemon login` on a machine with a browser, then start the daemon.');
             await writeHealth({ state: 'signed-out', error: 'Not signed in.' });
             await vault.close().catch(() => undefined);
@@ -610,7 +653,7 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
                 if (held !== undefined && !heldNoted.current) {
                     heldNoted.current = true;
                     jsonLog(io, 'warn', 'sync', `Holding ${held.count} deletions for an explicit decision; nothing was deleted`, {
-                        paths: held.paths,
+                        paths: redactPathList(held.paths, showNames),
                     });
                 } else if (held === undefined) {
                     heldNoted.current = false;
@@ -629,11 +672,11 @@ async function bootDaemon(request: BootRequest): Promise<{ boot: Boot } | { exit
                 }).catch(() => undefined);
             },
             onConflict: (event) => {
-                jsonLog(io, 'warn', 'conflict', `Conflict on ${event.path}: ${event.outcome}`, {
-                    path: event.path,
+                jsonLog(io, 'warn', 'conflict', `Conflict on ${showNames ? event.path : redactName(event.path)}: ${event.outcome}`, {
+                    path: showNames ? event.path : redactName(event.path),
                     reason: event.reason,
                     outcome: event.outcome,
-                    ...(event.copyPath !== undefined ? { copyPath: event.copyPath } : {}),
+                    ...(event.copyPath !== undefined ? { copyPath: showNames ? event.copyPath : redactName(event.copyPath) } : {}),
                 });
                 void writeHealth({ state: lastHealth.state, pendingConflicts: lastHealth.pendingConflicts + 1 }).catch(() => undefined);
             },
@@ -831,12 +874,14 @@ export type RunDaemonOptions = {
     pairing?: string | null;
     dryRun?: boolean;
     json?: boolean;
+    /** Opt-in plaintext note names for this run; falls back to the config. */
+    showNames?: boolean;
     deps?: DaemonDeps;
     io?: DaemonIO;
     env?: NodeJS.ProcessEnv;
     emitter?: SignalEmitter;
     exit?: (code: number) => void;
-    /** Heartbeat period in watch mode; shortened in tests. */
+    /** Heartbeat period in watch mode and once passes; shortened in tests. */
     heartbeatMs?: number;
     /**
      * How long without engine progress before the heartbeat stops pretending
@@ -857,6 +902,73 @@ function summarizeExit(summary: SyncSummary): ExitCode {
 }
 
 /**
+ * What the health heartbeat compares: only evidence of progress may earn a
+ * fresh `updatedAt`. Anything else — including a stuck transfer counter —
+ * withholds the write so a wedged pass reads as stale.
+ */
+function summaryFingerprint(summary: SyncSummary): string {
+    return JSON.stringify({
+        status: summary.status,
+        lastSyncedAt: summary.lastSyncedAt,
+        pending: summary.pending,
+        conflicts: summary.conflicts,
+        progressFraction: summary.progressFraction,
+        progress: summary.progress,
+        massDelete: summary.pendingMassDelete?.count ?? 0,
+    });
+}
+
+/**
+ * A progress-gated health heartbeat: only engine progress earns a fresh
+ * `updatedAt`. `stop()` settles in-flight ticks before returning, so a
+ * straggler can never publish `syncing` over the terminal write that
+ * follows — last-rename-wins would otherwise leave a finished pass reading
+ * as live.
+ */
+function startProgressHeartbeat(options: {
+    heartbeatMs: number;
+    getSummary: () => SyncSummary;
+    onProgress: (summary: SyncSummary) => Promise<unknown>;
+}): { stop(): Promise<void> } {
+    let lastFingerprint = summaryFingerprint(options.getSummary());
+    let inFlight = 0;
+    let stopped = false;
+    const timer = setInterval(() => {
+        if (stopped) {
+            return;
+        }
+        inFlight += 1;
+        void (async () => {
+            try {
+                if (stopped) {
+                    return;
+                }
+                const current = options.getSummary();
+                if (summaryFingerprint(current) === lastFingerprint) {
+                    return;
+                }
+                lastFingerprint = summaryFingerprint(current);
+                await options.onProgress(current);
+            } catch {
+                // The next tick (or the terminal write) is the backstop.
+            } finally {
+                inFlight -= 1;
+            }
+        })();
+    }, options.heartbeatMs);
+    timer.unref?.();
+    return {
+        async stop(): Promise<void> {
+            stopped = true;
+            clearInterval(timer);
+            while (inFlight > 0) {
+                await new Promise((resolve) => setTimeout(resolve, 5));
+            }
+        },
+    };
+}
+
+/**
  * Run one pass (`once`) or stay up (`watch`). Never auto-approves a mass
  * delete: `once` reports it as exit 3, `watch` keeps syncing everything
  * else and re-reports every pass.
@@ -872,16 +984,18 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
     try {
         if (options.dryRun) {
             const plan = boot.plan ?? (await boot.engine.plan(boot.client, boot.rootUid));
-            const changes = plan.uploads.length + plan.downloads.length + plan.conflicts.length + plan.removals.length;
+            // The report names vault paths: redact by default, like the log.
+            const shown = redactPlan(plan, options.showNames ?? boot.config.logShowsNames ?? false);
+            const changes = shown.uploads.length + shown.downloads.length + shown.conflicts.length + shown.removals.length;
             const report = {
                 localFiles: plan.localFiles,
                 localNotes: plan.localNotes,
                 remoteFiles: plan.remoteFiles,
-                uploads: options.json ? plan.uploads : plan.uploads.slice(0, 50),
-                downloads: options.json ? plan.downloads : plan.downloads.slice(0, 50),
-                conflicts: options.json ? plan.conflicts : plan.conflicts.slice(0, 50),
-                removals: options.json ? plan.removals : plan.removals.slice(0, 50),
-                held: plan.held,
+                uploads: options.json ? shown.uploads : shown.uploads.slice(0, 50),
+                downloads: options.json ? shown.downloads : shown.downloads.slice(0, 50),
+                conflicts: options.json ? shown.conflicts : shown.conflicts.slice(0, 50),
+                removals: options.json ? shown.removals : shown.removals.slice(0, 50),
+                held: options.json ? shown.held : shown.held.slice(0, 50),
                 unchanged: plan.unchanged,
             };
             if (options.json === true) {
@@ -917,54 +1031,93 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
                     void boot.engine.stop().catch(() => undefined);
                 },
             });
+            // Announce the pass before `engine.start`: a long first sync
+            // exceeds the health window, and without `syncing` here the
+            // supervisor reads a healthy pass as dead and restarts it.
+            const opening = boot.engine.getSummary();
+            await boot.writeHealth({
+                state: 'syncing',
+                lastSummary: opening,
+                pendingConflicts: opening.conflicts,
+                massDeleteHeld: opening.pendingMassDelete?.paths ?? [],
+                error: null,
+            });
+            // The same progress rule as watch: only engine progress earns a
+            // fresh `updatedAt`. A wedged pass is left to go stale — faking
+            // healthy would hide it from the supervisor forever.
+            const heartbeat = startProgressHeartbeat({
+                heartbeatMs: options.heartbeatMs ?? 30_000,
+                getSummary: () => boot.engine.getSummary(),
+                onProgress: (current) =>
+                    boot.writeHealth({
+                        state: 'syncing',
+                        lastSummary: current,
+                        pendingConflicts: current.conflicts,
+                        massDeleteHeld: current.pendingMassDelete?.paths ?? [],
+                        error: current.lastError,
+                    }),
+            });
             try {
-                await boot.engine.start(boot.client, boot.rootUid);
-            } catch (error) {
-                uninstallOnce();
-                if (interrupted || boot.sessionEnded()) {
-                    await boot.writeHealth({ state: boot.sessionEnded() ? 'signed-out' : 'stopped', error: null }).catch(() => undefined);
-                    await shutdownBoot(boot);
-                    return boot.sessionEnded() ? ExitCode.SignedOut : ExitCode.ItemFailures;
+                try {
+                    await boot.engine.start(boot.client, boot.rootUid);
+                } catch (error) {
+                    uninstallOnce();
+                    // The pass is over however it ended: silence the heartbeat
+                    // before publishing anything terminal (see below).
+                    await heartbeat.stop();
+                    if (interrupted || boot.sessionEnded()) {
+                        await boot.writeHealth({ state: boot.sessionEnded() ? 'signed-out' : 'stopped', error: null }).catch(() => undefined);
+                        await shutdownBoot(boot);
+                        return boot.sessionEnded() ? ExitCode.SignedOut : ExitCode.ItemFailures;
+                    }
+                    throw error;
                 }
-                throw error;
-            }
-            uninstallOnce();
-            if (interrupted && !boot.sessionEnded()) {
-                // The engine settled after the signal instead of throwing:
-                // the pass still did not finish, so it is not clean either.
-                await boot.writeHealth({ state: 'stopped', error: 'Interrupted before the pass finished.' }).catch(() => undefined);
-                await shutdownBoot(boot);
-                return ExitCode.ItemFailures;
-            }
-            if (boot.sessionEnded()) {
-                jsonLog(io, 'error', 'auth', 'The Proton session ended during the pass; not retrying without a human.');
-                await boot.writeHealth({ state: 'signed-out', error: 'The Proton session ended.' });
+                uninstallOnce();
+                // Silence the heartbeat before the terminal writes below, so
+                // no straggler tick can publish `syncing` over the final state.
+                // `stop()` settles in-flight ticks first; it is idempotent.
+                await heartbeat.stop();
+                if (interrupted && !boot.sessionEnded()) {
+                    // The engine settled after the signal instead of throwing:
+                    // the pass still did not finish, so it is not clean either.
+                    await boot.writeHealth({ state: 'stopped', error: 'Interrupted before the pass finished.' }).catch(() => undefined);
+                    await shutdownBoot(boot);
+                    return ExitCode.ItemFailures;
+                }
+                if (boot.sessionEnded()) {
+                    jsonLog(io, 'error', 'auth', 'The Proton session ended during the pass; not retrying without a human.');
+                    await boot.writeHealth({ state: 'signed-out', error: 'The Proton session ended.' });
+                    await boot.engine.stop().catch(() => undefined);
+                    await shutdownBoot(boot);
+                    return ExitCode.SignedOut;
+                }
+                const summary = boot.engine.getSummary();
+                const code = summarizeExit(summary);
+                if (code === ExitCode.MassDeleteHeld) {
+                    jsonLog(io, 'warn', 'sync', `Held ${summary.pendingMassDelete?.count} deletions; approve explicitly with approve-mass-delete.`, {
+                        paths: redactPathList(summary.pendingMassDelete?.paths ?? [], options.showNames ?? boot.config.logShowsNames ?? false),
+                    });
+                } else if (code === ExitCode.ItemFailures) {
+                    jsonLog(io, 'warn', 'sync', `Pass finished with item failures: ${summary.lastError}`, { pending: summary.pending });
+                } else {
+                    jsonLog(io, 'info', 'sync', 'Pass finished in sync.');
+                }
+                await boot.writeHealth({
+                    state: code === ExitCode.MassDeleteHeld ? 'mass-delete-held' : code === ExitCode.Ok ? 'idle' : 'error',
+                    lastSummary: summary,
+                    pendingConflicts: summary.conflicts,
+                    massDeleteHeld: summary.pendingMassDelete?.paths ?? [],
+                    lastPassAt: new Date().toISOString(),
+                    error: summary.lastError,
+                });
                 await boot.engine.stop().catch(() => undefined);
                 await shutdownBoot(boot);
-                return ExitCode.SignedOut;
+                return code;
+            } finally {
+                // Settle stragglers before returning: the terminal write above
+                // must be the last one the pass publishes.
+                await heartbeat.stop();
             }
-            const summary = boot.engine.getSummary();
-            const code = summarizeExit(summary);
-            if (code === ExitCode.MassDeleteHeld) {
-                jsonLog(io, 'warn', 'sync', `Held ${summary.pendingMassDelete?.count} deletions; approve explicitly with approve-mass-delete.`, {
-                    paths: summary.pendingMassDelete?.paths,
-                });
-            } else if (code === ExitCode.ItemFailures) {
-                jsonLog(io, 'warn', 'sync', `Pass finished with item failures: ${summary.lastError}`, { pending: summary.pending });
-            } else {
-                jsonLog(io, 'info', 'sync', 'Pass finished in sync.');
-            }
-            await boot.writeHealth({
-                state: code === ExitCode.MassDeleteHeld ? 'mass-delete-held' : code === ExitCode.Ok ? 'idle' : 'error',
-                lastSummary: summary,
-                pendingConflicts: summary.conflicts,
-                massDeleteHeld: summary.pendingMassDelete?.paths ?? [],
-                lastPassAt: new Date().toISOString(),
-                error: summary.lastError,
-            });
-            await boot.engine.stop().catch(() => undefined);
-            await shutdownBoot(boot);
-            return code;
         }
 
         // watch: the engine's own scheduler polls Drive; this loop is only
@@ -1010,17 +1163,7 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
         // Stall detection pins the Drive poll interval: a wedged engine must
         // read as stale within two polls, never as healthy forever.
         const stallAfterMs = options.stallAfterMs ?? 2 * boot.config.remotePollSeconds * 1000;
-        const fingerprint = (summary: SyncSummary): string =>
-            JSON.stringify({
-                status: summary.status,
-                lastSyncedAt: summary.lastSyncedAt,
-                pending: summary.pending,
-                conflicts: summary.conflicts,
-                progressFraction: summary.progressFraction,
-                progress: summary.progress,
-                massDelete: summary.pendingMassDelete?.count ?? 0,
-            });
-        let lastFingerprint = fingerprint(boot.engine.getSummary());
+        let lastFingerprint = summaryFingerprint(boot.engine.getSummary());
         let lastProgressAt = Date.now();
         let stallNoted = false;
         const heartbeat = setInterval(() => {
@@ -1030,9 +1173,9 @@ export async function runDaemon(options: RunDaemonOptions): Promise<ExitCode> {
                     return;
                 }
                 const current = boot.engine.getSummary();
-                if (fingerprint(current) !== lastFingerprint) {
+                if (summaryFingerprint(current) !== lastFingerprint) {
                     // Progress: the heartbeat is earned, and the stall clock restarts.
-                    lastFingerprint = fingerprint(current);
+                    lastFingerprint = summaryFingerprint(current);
                     lastProgressAt = Date.now();
                     stallNoted = false;
                     await boot.writeHealth({
@@ -1095,6 +1238,8 @@ export async function runMassDecision(options: {
     approve: boolean;
     /** First-sync winner for this run; falls back to the config file. */
     pairing?: string | null;
+    /** Opt-in plaintext note names for this run; falls back to the config. */
+    showNames?: boolean;
     deps?: DaemonDeps;
     io?: DaemonIO;
     env?: NodeJS.ProcessEnv;
@@ -1122,7 +1267,7 @@ export async function runMassDecision(options: {
             await shutdownBoot(boot);
             return ExitCode.Ok;
         }
-        jsonLog(io, 'warn', 'sync', `${options.approve ? 'Approving' : 'Denying'} ${held.count} held deletions.`, { paths: held.paths });
+        jsonLog(io, 'warn', 'sync', `${options.approve ? 'Approving' : 'Denying'} ${held.count} held deletions.`, { paths: redactPathList(held.paths, options.showNames ?? options.config.logShowsNames ?? false) });
         if (options.approve) {
             await boot.engine.approveMassDelete();
         } else {
@@ -1179,8 +1324,10 @@ export async function importStateFile(source: string, destStateFile: string): Pr
         }
         // Missing: the expected case, copy below.
     }
-    await mkdir(path.dirname(destStateFile), { recursive: true });
-    await writeFile(destStateFile, text, 'utf8');
+    await ensurePrivateDir(path.dirname(destStateFile));
+    await writeFile(destStateFile, text, { encoding: 'utf8', mode: 0o600 });
+    // The state carries note names and hashes: heal whatever was there before.
+    await chmod(destStateFile, 0o600).catch(() => undefined);
 }
 
 export async function runLogin(options: {
@@ -1189,6 +1336,13 @@ export async function runLogin(options: {
     configFile: string;
     importState?: string;
     pairing?: string | null;
+    /**
+     * Replace a session.bin the current key cannot open. Without it, an
+     * unreadable envelope refuses with exit 7 instead of being overwritten.
+     */
+    rotateKey?: boolean;
+    /** Opt-in plaintext note names for this run; falls back to the config. */
+    showNames?: boolean;
     deps?: DaemonDeps;
     io?: DaemonIO;
     env?: NodeJS.ProcessEnv;
@@ -1235,8 +1389,26 @@ export async function runLogin(options: {
         } catch {
             restored = false;
         }
+        if (!restored) {
+            // The old envelope may be sealed under a different key: overwriting
+            // it now would strand the session with no way back. Refuse unless
+            // the operator explicitly opted into replacing it.
+            const slot = await describeSlot(options.config.dataDir, key).catch(() => 'missing' as const);
+            if (slot === 'unreadable' && options.rotateKey !== true) {
+                const keyFile = env['PSS_KEY_FILE'];
+                const message =
+                    `Refusing to overwrite ${options.paths.sessionFile}: the key from ${keyFile} cannot open it ` +
+                    `(wrong or rotated key — not a Proton sign-in problem). ` +
+                    `Back up the data dir, then re-run \`login --rotate-key\` once the right key file is in place.`;
+                jsonLog(io, 'error', 'login', message);
+                await releaseLocks(locks);
+                return ExitCode.ConfigInvalid;
+            }
+        }
         if (restored) {
-            jsonLog(io, 'info', 'login', `Already signed in${auth.session.accountEmail !== null && auth.session.accountEmail !== undefined ? ` as ${auth.session.accountEmail}` : ''}. Nothing to do.`);
+            const showNames = options.showNames ?? options.config.logShowsNames ?? false;
+            const email = auth.session.accountEmail;
+            jsonLog(io, 'info', 'login', `Already signed in${email !== null && email !== undefined ? ` as ${showNames ? email : redactName(email)}` : ''}. Nothing to do.`);
             await releaseLocks(locks);
             return ExitCode.Ok;
         }
@@ -1482,6 +1654,8 @@ export async function runVerify(options: {
     config: DaemonConfig;
     paths: DaemonPaths;
     json?: boolean;
+    /** Opt-in plaintext note names for this run; falls back to the config. */
+    showNames?: boolean;
     deps?: DaemonDeps;
     io?: DaemonIO;
     env?: NodeJS.ProcessEnv;
@@ -1489,6 +1663,7 @@ export async function runVerify(options: {
     const io = options.io ?? defaultIO(options.env);
     const env = options.env ?? io.env;
     const deps = options.deps ?? {};
+    const showNames = options.showNames ?? options.config.logShowsNames ?? false;
     const logger = new Logger(options.config.logLevel, 'pss-daemon');
     let vaultStat: Awaited<ReturnType<typeof stat>>;
     try {
@@ -1531,6 +1706,17 @@ export async function runVerify(options: {
             restored = false;
         }
         signedIn = restored;
+        if (!restored) {
+            // Same distinction as the boot path: an envelope this key cannot
+            // open is a key mismatch (exit 7), not "signed out".
+            const key = await loadKeyMaterial(env);
+            const slot = await describeSlot(options.config.dataDir, key).catch(() => 'missing' as const);
+            if (slot === 'unreadable') {
+                const keyFile = env['PSS_KEY_FILE'];
+                jsonLog(io, 'error', 'verify', `The saved session cannot be opened with the key from ${keyFile}: wrong or rotated key. Run \`login --rotate-key\` once the right key file is in place.`);
+                return ExitCode.ConfigInvalid;
+            }
+        }
         const email = restored ? (auth.session.accountEmail ?? null) : null;
         if (restored) {
             verifyAuth = auth;
@@ -1613,7 +1799,11 @@ export async function runVerify(options: {
     const report = diffRecords(local, records, remote);
     const diverged = report.missingLocal.length + report.hashMismatch.length + report.remoteMissing.length + report.remoteMismatch.length;
     const CAP = 50;
-    const cap = (paths: string[]): string[] => (options.json === true ? paths : paths.slice(0, CAP));
+    // Counts stay exact; the paths redact to stable digests by default.
+    const cap = (paths: string[]): string[] => {
+        const shown = options.json === true ? paths : paths.slice(0, CAP);
+        return redactPathList(shown, showNames);
+    };
     const output = {
         checked: report.checked,
         matched: report.matched,

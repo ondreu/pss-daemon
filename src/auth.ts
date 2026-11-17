@@ -6,6 +6,7 @@ import { NodeType, NodeWithSameNameExistsValidationError } from '@protontech/dri
 
 import { Credentials } from '../../src/proton/credentials';
 import { ProtonSession } from '../../src/proton/session';
+import { UnreadableSlotError } from '../../src/proton/secretStore';
 import { DriveIO } from '../../src/sync/drive';
 import { isSafeName } from '../../src/sync/paths';
 import type { Logger } from '../../src/util/logger';
@@ -15,6 +16,34 @@ import type { CreateProtonAuth, ProtonAuth } from './ports';
 
 /** Session envelope in the data dir; see the daemon design doc, section 3. */
 export const SESSION_FILE_NAME = 'session.bin';
+
+/**
+ * What the session slot holds, without swallowing the distinction the
+ * daemon's exit codes depend on.
+ *
+ * - `missing`: no envelope yet — first login, or signed out. Reads as
+ *   "signed out", exit 4.
+ * - `readable`: the key opens the envelope.
+ * - `unreadable`: a file exists but this key cannot open it (wrong or
+ *   rotated key, torn write, tampering). This is a key mismatch — exit 7
+ *   naming the key file — never "signed out", and `login` must not silently
+ *   replace it without `--rotate-key`.
+ */
+export type SlotReadState = 'missing' | 'readable' | 'unreadable';
+
+/** Classify the session envelope for this key. Never throws for daemon-owned causes. */
+export async function describeSlot(dataDir: string, key: Uint8Array): Promise<SlotReadState> {
+    const slot = new FileSlot(join(dataDir, SESSION_FILE_NAME), key);
+    try {
+        const stored = await slot.read();
+        return stored === null ? 'missing' : 'readable';
+    } catch (error) {
+        if (error instanceof UnreadableSlotError) {
+            return 'unreadable';
+        }
+        throw error;
+    }
+}
 
 /** Encrypted Drive metadata cache in the data dir. */
 export const CACHE_FILE_NAME = 'drive-cache.bin';
