@@ -5,7 +5,7 @@
  */
 import { ConfigError, DEFAULT_DATA_DIR, loadDaemonConfig, resolveConfigPath } from './config';
 import { isHealthFresh, readHealthFile } from './health';
-import { runDaemon, runLogin, runMassDecision, runSignOut, runVerify, defaultIO, type DaemonDeps, type DaemonIO } from './daemon';
+import { runDaemon, runLogin, runMassDecision, runResolveFolder, runSignOut, runVerify, defaultIO, type DaemonDeps, type DaemonIO } from './daemon';
 import type { ParsedArgs } from './cli';
 import { ExitCode } from './types';
 
@@ -123,6 +123,8 @@ export async function runCommand(parsed: ParsedArgs, options: CommandDeps = {}):
                 return await runMassDecision({ ...base, approve: false, pairing: parsed.pairing ?? null, showNames: parsed.showNames });
             case 'sign-out':
                 return await runSignOut(base);
+            case 'resolve-folder':
+                return await runResolveFolder({ ...base, target: parsed.target ?? '', json: parsed.json, create: parsed.create ?? false });
         }
     } catch (error) {
         // Everything with its own code already returned; this is unexpected —

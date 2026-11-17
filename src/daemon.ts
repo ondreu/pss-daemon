@@ -36,7 +36,7 @@ import { emptyHealth, writeHealthFile, type DaemonState, type HealthFile } from 
 import { fsyncDir } from './nodeAdapter';
 import { redactName, redactPathList, redactPlan, redactSummary } from './redaction';
 import { ensurePrivateDir, privateTempPath } from './secureFs';
-import type { CreateHeadlessVault, CreateProtonAuth, HeadlessVault } from './ports';
+import type { CreateHeadlessVault, CreateProtonAuth, HeadlessVault, ProtonAuth } from './ports';
 import { ExitCode, type DaemonConfig, type DaemonPaths } from './types';
 
 // ---------------------------------------------------------------------------
@@ -1451,6 +1451,61 @@ export async function runLogin(options: {
         }
         await releaseLocks(locks);
         throw error;
+    }
+}
+
+/**
+ * Resolve a folder below /my-files to the uid the SDK itself uses.
+ *
+ * A uid copied from the Proton CLI is not guaranteed to be the form this SDK
+ * expects on the wire; a wrong one fails deep inside the SDK with an API error
+ * about an invalid LinkID, which reads like a broken account rather than a bad
+ * config value. Asking the SDK — walking by name from the root — can only
+ * return a uid it produced, so the runbook uses this instead of copying one
+ * from another client.
+ */
+export async function runResolveFolder(options: {
+    config: DaemonConfig;
+    paths: DaemonPaths;
+    target: string;
+    json?: boolean;
+    /** Create the last missing folder; used to provision a sync folder with SDK-native ids. */
+    create?: boolean;
+    deps?: DaemonDeps;
+    io?: DaemonIO;
+    env?: NodeJS.ProcessEnv;
+}): Promise<ExitCode> {
+    const io = options.io ?? defaultIO(options.env);
+    const env = options.env ?? io.env;
+    const deps = options.deps ?? {};
+    if (options.target.trim() === '') {
+        io.stderr('pss-daemon: resolve-folder needs a path below /my-files.');
+        return ExitCode.Usage;
+    }
+    const logger = new Logger(options.config.logLevel, 'pss-daemon');
+    try {
+        const key = await loadKeyMaterial(env);
+        const clientUid = await readClientUid(options.config.dataDir);
+        const createAuth = deps.createAuth ?? createProtonAuth;
+        const auth = (await createAuth({
+            dataDir: options.config.dataDir,
+            key,
+            clientUid,
+            logger,
+            remoteFolderUid: null,
+        })) as ProtonAuth & {
+            resolveFolder(spec: string, options?: { create?: boolean }): Promise<{ uid: string; path: string }>;
+        };
+        if (!(await auth.restore())) {
+            io.stderr('pss-daemon: not signed in; run `login` first.');
+            return ExitCode.SignedOut;
+        }
+        const resolved = await auth.resolveFolder(options.target, { create: options.create === true });
+        io.stdout(options.json === true ? JSON.stringify(resolved) : `${resolved.path}\n${resolved.uid}`);
+        return ExitCode.Ok;
+    } catch (error) {
+        io.stderr(`pss-daemon: ${error instanceof Error ? error.message : String(error)}`);
+        return ExitCode.Usage;
     }
 }
 

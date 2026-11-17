@@ -4,9 +4,9 @@
  * section 2), and usage errors are the caller's problem to report, not the
  * parser's — `parseArgs` never touches stdout.
  */
-export type CommandName = 'login' | 'status' | 'once' | 'watch' | 'verify' | 'approve-mass-delete' | 'deny-mass-delete' | 'sign-out';
+export type CommandName = 'login' | 'status' | 'once' | 'watch' | 'verify' | 'approve-mass-delete' | 'deny-mass-delete' | 'sign-out' | 'resolve-folder';
 
-export const COMMANDS: CommandName[] = ['login', 'status', 'once', 'watch', 'verify', 'approve-mass-delete', 'deny-mass-delete', 'sign-out'];
+export const COMMANDS: CommandName[] = ['login', 'status', 'once', 'watch', 'verify', 'approve-mass-delete', 'deny-mass-delete', 'sign-out', 'resolve-folder'];
 
 const PAIRINGS = ['adopt-drive', 'adopt-vault', 'merge'];
 
@@ -16,6 +16,8 @@ export type ParsedArgs = {
     config?: string;
     /** `--json`: machine-readable output where the command supports it. */
     json?: boolean;
+    /** `--create`: resolve-folder may create the last missing folder (login/provisioning). */
+    create?: boolean;
     /** `--dry-run`: plan only, no writes. */
     dryRun?: boolean;
     /** `--pairing MODE`: first-sync winner for this run (persisted by login). */
@@ -29,6 +31,8 @@ export type ParsedArgs = {
     help?: boolean;
     version?: boolean;
     probe?: boolean;
+    /** `resolve-folder <path>`: the path below /my-files to resolve to a uid. */
+    target?: string;
     /** Set when the arguments are unusable; the caller prints usage and exits 1. */
     error?: string;
 };
@@ -85,6 +89,8 @@ export function parseArgs(argv: string[]): ParsedArgs {
             parsed.probe = true;
         } else if (arg === '--json') {
             parsed.json = true;
+        } else if (arg === '--create') {
+            parsed.create = true;
         } else if (arg === '--dry-run') {
             parsed.dryRun = true;
         } else if (arg === '--show-names') {
@@ -132,15 +138,24 @@ export function parseArgs(argv: string[]): ParsedArgs {
         i += 1;
     }
 
-    if (positional.length > 1) {
-        return fail(`Too many commands: "${positional.join(' ')}".`);
+    if (positional.length > 2) {
+        return fail(`Too many arguments: "${positional.join(' ')}".`);
     }
-    if (positional.length === 1) {
+    if (positional.length >= 1) {
         const command = positional[0];
         if (!(COMMANDS as string[]).includes(command)) {
             return fail(`Unknown command "${command}".`);
         }
         parsed.command = command as CommandName;
+    }
+    if (positional.length === 2) {
+        if (parsed.command !== 'resolve-folder') {
+            return fail(`"${parsed.command}" takes no argument.`);
+        }
+        parsed.target = positional[1];
+    }
+    if (parsed.command === 'resolve-folder' && parsed.target === undefined) {
+        return fail('resolve-folder needs a path below /my-files.');
     }
     if (parsed.pairing !== undefined && !PAIRINGS.includes(parsed.pairing)) {
         return fail(`--pairing must be one of ${PAIRINGS.map((mode) => `"${mode}"`).join(', ')}.`);
