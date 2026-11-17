@@ -125,11 +125,14 @@ test('two live lock objects in one process: the second is refused', async () => 
     }
 });
 
-test('an unreadable lock file is taken over, not trusted', async () => {
+test('a stale unreadable lock file is taken over, not trusted', async () => {
     const root = dir();
     try {
         const lockPath = path.join(root, 'daemon.lock');
         writeFileSync(lockPath, 'not-json{{{');
+        // Older than the stale window: abandoned debris, not a live holder.
+        const old = new Date(Date.now() - 600_000);
+        utimesSync(lockPath, old, old);
         const reasons: string[] = [];
         const lock = await DaemonLock.acquire(
             lockPath,

@@ -26,9 +26,11 @@
  * collides then. This is the correction to the design doc, which named only
  * the data-dir file.
  */
-import { mkdir, open, readFile, stat } from 'node:fs/promises';
+import { link, open, readFile, rename, stat, unlink } from 'node:fs/promises';
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
+
+import { ensurePrivateDir, privateTempPath } from './secureFs';
 
 export type LockInfo = {
     pid: number;
@@ -108,6 +110,56 @@ function describeStale(existing: string, reason: string): string {
 
 type Verdict = { held: true; holder: LockInfo | null } | { held: false; reason: string };
 
+/** Best-effort removal of our own debris; the name was never published. */
+async function removeQuietly(target: string): Promise<void> {
+    try {
+        await unlink(target);
+    } catch {
+        // Already gone (or never created): nothing published, nothing to do.
+    }
+}
+
+/**
+ * Publish a payload with no torn window: write and flush a temp file, then
+ * `link` it into place. `link` either creates the name or fails `EEXIST` —
+ * unlike create-then-fill, a concurrent reader never observes a half file.
+ */
+async function createExclusive(lockPath: string, payload: string): Promise<void> {
+    const tmp = privateTempPath(lockPath);
+    const handle = await open(tmp, 'wx', 0o600);
+    try {
+        await handle.writeFile(payload, 'utf8');
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+    try {
+        await link(tmp, lockPath);
+    } catch (error) {
+        await removeQuietly(tmp);
+        throw error;
+    }
+    await removeQuietly(tmp);
+}
+
+/**
+ * Replace a live payload readers may hold open: temp file plus `rename`,
+ * never truncate-in-place. Rename is atomic: readers see the old file or
+ * the new file, both complete. The temp file is `0600` in the same `0700`
+ * directory, so the published file keeps owner-only modes.
+ */
+async function replaceAtomically(lockPath: string, payload: string): Promise<void> {
+    const tmp = privateTempPath(lockPath);
+    const handle = await open(tmp, 'wx', 0o600);
+    try {
+        await handle.writeFile(payload, 'utf8');
+        await handle.sync();
+    } finally {
+        await handle.close();
+    }
+    await rename(tmp, lockPath);
+}
+
 async function heartbeatAgeMs(lockPath: string, holder: LockInfo, now: number): Promise<number> {
     const ages: number[] = [];
     if (typeof holder.heartbeatAt === 'string') {
@@ -143,7 +195,6 @@ export class DaemonLock {
     private constructor(
         readonly lockPath: string,
         readonly info: LockInfo,
-        private readonly handle: Awaited<ReturnType<typeof open>>,
     ) {}
 
     /**
@@ -165,16 +216,11 @@ export class DaemonLock {
         onTakeover: (message: string) => void = (message) => process.stderr.write(message + '\n'),
         options: AcquireOptions = {},
     ): Promise<DaemonLock> {
-        await mkdir(path.dirname(lockPath), { recursive: true });
+        await ensurePrivateDir(path.dirname(lockPath));
         const payload = JSON.stringify({ ...info, heartbeatAt: new Date().toISOString() });
         try {
-            const handle = await open(lockPath, 'wx', 0o600);
-            await handle.writeFile(payload, 'utf8');
-            // Flushed before returning, or a crash between create and flush
-            // leaves a lock file whose payload is torn — and a torn file
-            // reads as "unreadable, take over".
-            await handle.sync();
-            return new DaemonLock(lockPath, info, handle).startHeartbeat(options);
+            await createExclusive(lockPath, payload);
+            return new DaemonLock(lockPath, info).startHeartbeat(options);
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
                 throw error;
@@ -191,10 +237,8 @@ export class DaemonLock {
             // Lost a race with another starter; re-read below decides.
         }
         try {
-            const handle = await open(lockPath, 'wx', 0o600);
-            await handle.writeFile(payload, 'utf8');
-            await handle.sync();
-            return new DaemonLock(lockPath, info, handle).startHeartbeat(options);
+            await createExclusive(lockPath, payload);
+            return new DaemonLock(lockPath, info).startHeartbeat(options);
         } catch (error) {
             if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
                 throw error;
@@ -209,32 +253,65 @@ export class DaemonLock {
         await unlink(lockPath);
     }
 
-    /** Replace the payload in place and flush it; see {@link startHeartbeat}. */
-    private static async rewrite(handle: Awaited<ReturnType<typeof open>>, payload: string): Promise<void> {
-        await handle.truncate(0);
-        await handle.write(payload, 0, 'utf8');
-        await handle.sync();
+    /** Replace the payload atomically; see {@link replaceAtomically}. */
+    private static async rewrite(lockPath: string, payload: string): Promise<void> {
+        await replaceAtomically(lockPath, payload);
+    }
+
+    /**
+     * Read the payload, retrying a few times. Heartbeats publish atomically
+     * now, but a reader can still land on any transient state — and a torn
+     * file must never read as a free lock on a single glance.
+     */
+    private static async readHolder(lockPath: string): Promise<{ status: 'missing' } | { status: 'torn' } | { status: 'ok'; holder: LockInfo }> {
+        for (let attempt = 0; ; attempt += 1) {
+            let text: string;
+            try {
+                text = await readFile(lockPath, 'utf8');
+            } catch (error) {
+                if ((error as NodeJS.ErrnoException).code === 'ENOENT') {
+                    return { status: 'missing' };
+                }
+                throw error;
+            }
+            try {
+                const parsed = JSON.parse(text) as Partial<LockInfo>;
+                if (typeof parsed.pid === 'number' && typeof parsed.vaultPath === 'string') {
+                    return { status: 'ok', holder: parsed as LockInfo };
+                }
+            } catch {
+                // Torn mid-rewrite (or garbage): retry below, then judge.
+            }
+            if (attempt >= 5) {
+                return { status: 'torn' };
+            }
+            await new Promise((resolve) => setTimeout(resolve, 10));
+        }
     }
 
     private static async inspect(lockPath: string, probe: LockProbe, now: number): Promise<Verdict> {
-        let text: string;
-        try {
-            text = await readFile(lockPath, 'utf8');
-        } catch {
+        const read = await DaemonLock.readHolder(lockPath);
+        if (read.status === 'missing') {
             return { held: false, reason: 'the lock file vanished mid-acquire' };
         }
-        let holder: LockInfo | null = null;
-        try {
-            const parsed = JSON.parse(text) as Partial<LockInfo>;
-            if (typeof parsed.pid === 'number' && typeof parsed.vaultPath === 'string') {
-                holder = parsed as LockInfo;
+        if (read.status === 'torn') {
+            // An unreadable file that was touched recently belongs to someone
+            // alive enough to write: treating it as stale would hand a live
+            // lock to a second holder. Fail closed — only an unreadable file
+            // older than the stale window may be taken over.
+            let ageMs = Number.POSITIVE_INFINITY;
+            try {
+                ageMs = now - (await stat(lockPath)).mtimeMs;
+            } catch {
+                return { held: false, reason: 'the lock file vanished mid-acquire' };
             }
-        } catch {
-            holder = null;
+            if (ageMs <= LOCK_STALE_MS) {
+                return { held: true, holder: null };
+            }
+            const age = Number.isFinite(ageMs) ? `${Math.round(ageMs / 1000)}s old` : 'missing';
+            return { held: false, reason: `its lock file is unreadable and ${age}` };
         }
-        if (holder === null) {
-            return { held: false, reason: 'the lock file is unreadable' };
-        }
+        const holder = read.holder;
         const bootId = probe.readBootId();
         if (typeof holder.bootId === 'string' && holder.bootId !== '' && bootId !== null && holder.bootId !== bootId) {
             return { held: false, reason: `its owner (pid ${holder.pid}) started on a previous boot` };
@@ -262,10 +339,10 @@ export class DaemonLock {
      * as stale. Best effort: a holder that can no longer write its lock is
      * indistinguishable from a dead one, and should read that way.
      *
-     * The rewrite truncates first and writes at position 0:
-     * `FileHandle.writeFile` appends at the current offset, so reusing it
-     * would glue one JSON object after another and the file would read as
-     * "unreadable, take over" — the live lock stolen by its own heartbeat.
+     * The rewrite publishes through a temp file plus `rename`, never
+     * truncate-in-place: a concurrent starter sees the old file or the new
+     * file, both complete — never a torn half-write it would mistake for a
+     * free lock.
      */
     private startHeartbeat(options: AcquireOptions): this {
         const heartbeatMs = options.heartbeatMs ?? LOCK_HEARTBEAT_MS;
@@ -278,7 +355,7 @@ export class DaemonLock {
                     return;
                 }
                 try {
-                    await DaemonLock.rewrite(this.handle, JSON.stringify({ ...this.info, heartbeatAt: new Date().toISOString() }));
+                    await DaemonLock.rewrite(this.lockPath, JSON.stringify({ ...this.info, heartbeatAt: new Date().toISOString() }));
                 } catch {
                     // The next starter's staleness check is the backstop.
                 }
@@ -288,7 +365,12 @@ export class DaemonLock {
         return this;
     }
 
-    /** Close and remove the lock file. Missing file is fine (taken over). */
+    /**
+     * Close and remove the lock file — but only when it is still ours. A
+     * successor may hold the name after a takeover this process never
+     * noticed; unconditionally unlinking would delete the live lock out from
+     * under it. Missing, torn or foreign files are left alone.
+     */
     async release(): Promise<void> {
         if (this.released) {
             return;
@@ -298,8 +380,14 @@ export class DaemonLock {
             clearInterval(this.heartbeat);
             this.heartbeat = null;
         }
-        await this.handle.close().catch(() => undefined);
-        await DaemonLock.unlink(this.lockPath).catch(() => undefined);
+        try {
+            const parsed = JSON.parse(await readFile(this.lockPath, 'utf8')) as Partial<LockInfo>;
+            if (parsed.pid === this.info.pid && parsed.startedAt === this.info.startedAt && parsed.vaultPath === this.info.vaultPath) {
+                await DaemonLock.unlink(this.lockPath).catch(() => undefined);
+            }
+        } catch {
+            // Not ours to remove.
+        }
     }
 }
 
