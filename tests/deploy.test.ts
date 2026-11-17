@@ -80,6 +80,8 @@ describe('deployment artifacts', () => {
         assert.match(backup, /--exclude='session\.bin'/, 'excludes the encrypted session');
         assert.match(backup, /--exclude='drive-cache\.bin'/, 'excludes the drive cache');
         assert.match(backup, /"\$STATUS_FILE"/, 'consults status.json before archiving');
+        assert.match(backup, /starting\|syncing/, 'both starting and syncing read as a pass in flight');
+        assert.match(backup, /no status\.json yet.*unprovable/, 'a missing status.json refuses instead of backing up blind');
         assert.match(backup, /--allow-active/, 'mid-pass override is explicit');
         assert.match(backup, /tar -tzf "\$ARCHIVE"/, 'verifies the archive with tar -t');
         assert.match(backup, /PSS_BACKUP_KEEP/, 'rotates to N copies');
